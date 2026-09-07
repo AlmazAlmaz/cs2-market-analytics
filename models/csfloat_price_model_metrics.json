@@ -1,0 +1,185 @@
+{
+  "artifact_version": 3,
+  "trained_at": "2026-08-09T23:21:50.103724+00:00",
+  "stage": "production",
+  "production_promoted": true,
+  "db_path": "csfloat_history.db",
+  "rows": 795869,
+  "train_rows": 668914,
+  "validation_rows": 74323,
+  "test_rows": 51802,
+  "source_database_before": {
+    "resolved_path": "csfloat_history.db",
+    "file_size": 4106903552,
+    "file_mtime_ns": 1786316845773976383,
+    "sales_rows": 795869,
+    "distinct_listing_rows": 795869,
+    "min_sold_at": "2020-04-04T08:08:44.79021Z",
+    "max_sold_at": "2026-08-09T22:34:09.594496Z",
+    "max_fetched_at": "2026-08-09T22:46:47.873446+00:00",
+    "valid_price_rows": 795869,
+    "sticker_rows": 413169,
+    "sticker_listing_rows": 141879,
+    "sqlite_user_version": 0,
+    "logical_sha256": "765c4eacd3b391f1a90955afdc17ee6fe8e81a0f0dcab26e58677d4680733ead"
+  },
+  "source_database_after": {
+    "resolved_path": "csfloat_history.db",
+    "file_size": 4106903552,
+    "file_mtime_ns": 1786316845773976383,
+    "sales_rows": 795869,
+    "distinct_listing_rows": 795869,
+    "min_sold_at": "2020-04-04T08:08:44.79021Z",
+    "max_sold_at": "2026-08-09T22:34:09.594496Z",
+    "max_fetched_at": "2026-08-09T22:46:47.873446+00:00",
+    "valid_price_rows": 795869,
+    "sticker_rows": 413169,
+    "sticker_listing_rows": 141879,
+    "sqlite_user_version": 0,
+    "logical_sha256": "765c4eacd3b391f1a90955afdc17ee6fe8e81a0f0dcab26e58677d4680733ead"
+  },
+  "database_changed_during_training": false,
+  "rows_after_reference_filter": 795039,
+  "dropped_rows_without_runtime_reference": 830,
+  "split": {
+    "method": "production_trained_at_shared_holdout",
+    "holdout_after": "2026-08-06T09:11:22.452694+00:00",
+    "train_rows": 668914,
+    "validation_rows": 74323,
+    "test_rows": 51802,
+    "train_min_sold_at": "2023-10-02T13:56:35.285722+00:00",
+    "train_max_sold_at": "2026-08-03T06:07:57.718708+00:00",
+    "validation_min_sold_at": "2026-08-03T06:08:44.811530+00:00",
+    "validation_max_sold_at": "2026-08-06T09:11:22.429845+00:00",
+    "test_min_sold_at": "2026-08-06T09:11:32.298945+00:00",
+    "test_max_sold_at": "2026-08-09T22:34:09.594496+00:00",
+    "test_untouched_until_final_evaluation": true
+  },
+  "target": "log1p(price_cents) - log1p(reference_anchor_cents)",
+  "runtime_unsafe_features_removed": [
+    "listing_age_hours",
+    "watchers"
+  ],
+  "max_iter": 700,
+  "point_only": false,
+  "reused_point_model": "models/staging/almaz/csfloat_price_model.joblib",
+  "validation": {
+    "mae_cents": 154.9710513930529,
+    "mae_usd": 1.549710513930529,
+    "median_absolute_percentage_error": 0.057010093180168475,
+    "mean_absolute_percentage_error": 0.13292368056481238,
+    "p75_absolute_percentage_error": 0.14980802468328713,
+    "p90_absolute_percentage_error": 0.2933347214615506,
+    "rmse_log_price": 0.2437730968671569,
+    "r2_log_price": 0.9886296811564746
+  },
+  "test": {
+    "mae_cents": 162.76453886784503,
+    "mae_usd": 1.6276453886784503,
+    "median_absolute_percentage_error": 0.056503322669765155,
+    "mean_absolute_percentage_error": 0.11728755537175779,
+    "p75_absolute_percentage_error": 0.1494404775052898,
+    "p90_absolute_percentage_error": 0.28841666612286326,
+    "rmse_log_price": 0.23235115499243528,
+    "r2_log_price": 0.9900172968781839
+  },
+  "test_interval_coverage_15_85_log": 0.7143739623952743,
+  "test_raw_quantile_crossing_rate": 0.0,
+  "prediction_calibration": {
+    "premium_scale": 0.8500000000000001,
+    "center_offset": -0.0005335684030942645,
+    "validation_metrics": {
+      "mae_cents": 154.9710513930529,
+      "mae_usd": 1.549710513930529,
+      "median_absolute_percentage_error": 0.057010093180168475,
+      "mean_absolute_percentage_error": 0.13292368056481238,
+      "p75_absolute_percentage_error": 0.14980802468328713,
+      "p90_absolute_percentage_error": 0.2933347214615506,
+      "rmse_log_price": 0.2437730968671569,
+      "r2_log_price": 0.9886296811564746
+    },
+    "low_offset": -0.012047277493938791,
+    "high_offset": 0.01952423055233619
+  },
+  "shared_holdout_comparison": {
+    "holdout_rows": 51802,
+    "production_model_path": "models/backups/almaz_20260809T232401Z/csfloat_price_model.joblib",
+    "production_trained_at": "2026-08-06T09:11:22.452694+00:00",
+    "production": {
+      "mae_cents": 237.4547065901927,
+      "mae_usd": 2.374547065901927,
+      "median_absolute_percentage_error": 0.07275219851037748,
+      "mean_absolute_percentage_error": 0.1288836671035993,
+      "p75_absolute_percentage_error": 0.15823824966050515,
+      "p90_absolute_percentage_error": 0.30950396230819344,
+      "rmse_log_price": 0.26618889932199347,
+      "r2_log_price": 0.9868979767635192
+    },
+    "staging": {
+      "mae_cents": 162.76453886784503,
+      "mae_usd": 1.6276453886784503,
+      "median_absolute_percentage_error": 0.056503322669765155,
+      "mean_absolute_percentage_error": 0.11728755537175779,
+      "p75_absolute_percentage_error": 0.1494404775052898,
+      "p90_absolute_percentage_error": 0.28841666612286326,
+      "rmse_log_price": 0.23235115499243528,
+      "r2_log_price": 0.9900172968781839
+    },
+    "staging_minus_production": {
+      "median_absolute_percentage_error": -0.016248875840612326,
+      "mean_absolute_percentage_error": -0.01159611173184151,
+      "p90_absolute_percentage_error": -0.021087296185330173,
+      "mae_cents": -74.69016772234767
+    },
+    "staging_proves_primary_improvement": true,
+    "production_artifact_role": "pre_promotion_v2_baseline"
+  },
+  "market_stats_contract": {
+    "test_features": "development_only_before_holdout",
+    "saved_artifact_runtime": "full_source_snapshot_at_training_time"
+  },
+  "notes": [
+    "Train, validation, and test are chronological; test is untouched by fitting and calibration.",
+    "The saved artifact is staging-only and is not loaded by the production runtime path.",
+    "Historical CSFloat reference fields are collection-time snapshots, not true sale-time snapshots."
+  ],
+  "promoted_at": "2026-08-09T23:24:01.794968+00:00",
+  "promotion_backup_dir": "models/backups/almaz_20260809T232401Z",
+  "model_sha256": "a988fdaa8d5fc64b46db822f4206a2657738cb5af32b1001b10bf693ea1c1c2d",
+  "usable_rows": 795039,
+  "shared_holdout_peer_comparison": {
+    "holdout_after": "2026-08-06T09:11:22.452694+00:00",
+    "rows": 51802,
+    "method": "walk_forward_features_and_identical_runtime-valid rows; no peer retraining",
+    "almaz_v3": {
+      "mae_cents": 162.76453886784503,
+      "mae_usd": 1.6276453886784503,
+      "median_absolute_percentage_error": 0.056503322669765155,
+      "mean_absolute_percentage_error": 0.11728755537175779,
+      "p75_absolute_percentage_error": 0.1494404775052898,
+      "p90_absolute_percentage_error": 0.28841666612286326,
+      "rmse_log_price": 0.23235115499243528,
+      "r2_log_price": 0.9900172968781839
+    },
+    "igor_v1": {
+      "mae_cents": 144.3197000395447,
+      "mae_usd": 1.443197000395447,
+      "median_absolute_percentage_error": 0.04809677148973539,
+      "mean_absolute_percentage_error": 0.11027985597235385,
+      "p75_absolute_percentage_error": 0.1374365418329482,
+      "p90_absolute_percentage_error": 0.2811778971580154,
+      "rmse_log_price": 0.2268077667416812,
+      "r2_log_price": 0.9904879455189136
+    },
+    "nova_v1": {
+      "mae_cents": 158.23207778324283,
+      "mae_usd": 1.5823207778324282,
+      "median_absolute_percentage_error": 0.05031710606805564,
+      "mean_absolute_percentage_error": 0.11682194213610667,
+      "p75_absolute_percentage_error": 0.1411114762115907,
+      "p90_absolute_percentage_error": 0.2901824151882229,
+      "rmse_log_price": 0.24053322942789207,
+      "r2_log_price": 0.9893018508393038
+    }
+  }
+}

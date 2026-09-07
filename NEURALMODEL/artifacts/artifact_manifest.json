@@ -1,0 +1,44 @@
+{
+  "artifact_version": 2,
+  "bundle_sha256": "5c45a51b1078b92c756a5ed2c89c2a1e7009e051e2ca8b1abfde2ce760ab6ea7",
+  "feature_contract_sha256": "f392d883fc95ff11025fd4f26799a7b713bdc39eca86bb9f33fff7daf5436ce2",
+  "files": {
+    "nova_metadata.json": {
+      "sha256": "4ee27d2e5c4382c574f3f3789d019874be833b0f2f300d8e323a6bed7e9aeaca",
+      "size_bytes": 19664092
+    },
+    "nova_metrics.json": {
+      "sha256": "d6bd6e9c568fdada29e2b6b93ca564af41262573bfe4c1fef2699a26a40c839f",
+      "size_bytes": 9136
+    },
+    "nova_price_model.pt": {
+      "sha256": "2cc35ee335014361b81262a38c16459cfb00fb3710eccbd09359e7a7a7453a2e",
+      "size_bytes": 34550249
+    }
+  },
+  "generated_at": "2026-08-11T12:59:23.550871+00:00",
+  "model_name": "nova",
+  "production_promoted": true,
+  "promotion": {
+    "backup_directory": "NEURALMODEL/backups/nova_20260811T125923.510828Z",
+    "candidate_bundle_sha256": "520c1b6866fb5680b8b20be1e02a3f863754380f37b1d688c6af53fb8af65599",
+    "candidate_directory": "NEURALMODEL/staging/training_jobs/9be34c6738224cc08ce365d06311cd24",
+    "promoted_at": "2026-08-11T12:59:23.550871+00:00"
+  },
+  "quality_gate": {
+    "holdout_rows": 5000,
+    "interval_coverage": 0.6894,
+    "point_outside_raw_interval_rate": 0.0,
+    "production_trained_at": "2026-08-09T21:33:19.947223+00:00",
+    "quantile_crossing_rate": 0.0,
+    "raw_interval_coverage": 0.6894,
+    "strictly_improved_metrics": [
+      "median_ape_percent",
+      "mean_ape_percent",
+      "p90_ape_percent"
+    ]
+  },
+  "schema_version": 1,
+  "stage": "production",
+  "trained_at": "2026-08-11T12:58:46.173752+00:00"
+}

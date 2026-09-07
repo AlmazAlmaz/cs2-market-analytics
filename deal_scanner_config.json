@@ -1,0 +1,53 @@
+{
+  "scan_interval_seconds": 600,
+  "stickers_per_cycle": 5,
+  "listings_per_sticker": 50,
+  "listing_pages_per_sticker": 1,
+  "stale_prediction_hours": 24,
+  "sort_by": "most_recent",
+  "max_sticker_targets": 120,
+  "liquid_skins_enabled": true,
+  "liquid_skins_per_cycle": 2,
+  "listings_per_liquid_skin": 20,
+  "listing_pages_per_liquid_skin": 1,
+  "max_liquid_skin_targets": 80,
+  "liquid_skin_max_price_cents": 1000,
+  "liquid_skin_min_estimated_sales_per_day": 0.5,
+  "liquid_skin_min_quantity": 250,
+  "liquid_skin_sort_by": "lowest_price",
+  "liquid_skin_catalog_path": "ALL_SKINS.json",
+  "knives_enabled": true,
+  "knives_per_cycle": 1,
+  "listings_per_knife": 10,
+  "listing_pages_per_knife": 1,
+  "max_knife_targets": 24,
+  "knife_rediscovery_cycles": 6,
+  "knife_sort_by": "lowest_price",
+  "gloves_enabled": false,
+  "gloves_per_cycle": 1,
+  "listings_per_glove": 10,
+  "listing_pages_per_glove": 1,
+  "max_glove_targets": 24,
+  "glove_rediscovery_cycles": 6,
+  "glove_sort_by": "lowest_price",
+  "tournament_patterns": [
+    "Katowice 2014",
+    "Katowice 2015"
+  ],
+  "extra_sticker_names": [
+    "Sticker | Crown (Foil)"
+  ],
+  "min_roi_percent": 8.0,
+  "min_profit_usd": 1.0,
+  "min_liquidity_score": 20.0,
+  "save_verdicts": [
+    "good",
+    "watch"
+  ],
+  "save_all_predictions": false,
+  "enabled_models": [
+    "almaz",
+    "igor",
+    "nova"
+  ]
+}

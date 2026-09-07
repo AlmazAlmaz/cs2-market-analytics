@@ -1,0 +1,17 @@
+# Format:
+# key_file|proxy_url
+#
+# SOCKS5 from Amnezia:
+# key2|socks5://login:password@proxy_ip:proxy_port
+#
+# HTTP/HTTPS proxy also works:
+# key2|http://login:password@proxy_ip:proxy_port
+#
+# If a key must use the current system VPN/IP, leave proxy empty:
+# key4|
+#
+# Examples:
+key2|
+key|socks5://login:password@proxy_ip:proxy_port
+key3|socks5://login:password@proxy_ip:proxy_port
+key4|

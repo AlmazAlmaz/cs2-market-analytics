@@ -1,0 +1,44 @@
+[
+  {
+    "id": "skin-redline",
+    "name": "AK-47 | Redline",
+    "collections": [
+      {"id": "collection-phoenix", "name": "The Phoenix Collection"}
+    ],
+    "crates": [
+      {"id": "crate-4009", "name": "Operation Phoenix Weapon Case"}
+    ]
+  },
+  {
+    "id": "skin-karambit-doppler-p1",
+    "name": "★ Karambit | Doppler",
+    "collections": [],
+    "crates": [
+      {"id": "crate-gamma", "name": "Gamma Case"}
+    ]
+  },
+  {
+    "id": "skin-karambit-doppler-p2",
+    "name": "★ Karambit | Doppler",
+    "collections": [],
+    "crates": [
+      {"id": "crate-gamma-2", "name": "Gamma 2 Case"}
+    ]
+  },
+  {
+    "id": "skin-sport-gloves-vice",
+    "name": "★ Sport Gloves | Vice",
+    "collections": [],
+    "crates": [
+      {"id": "crate-clutch", "name": "Clutch Case"}
+    ]
+  },
+  {
+    "id": "skin-grouped-only",
+    "name": "Grouped-only row must not become a market variant",
+    "collections": [
+      {"id": "collection-only", "name": "Grouped-only Collection"}
+    ],
+    "crates": []
+  }
+]
