@@ -43,7 +43,7 @@ def test_deal_cards_display_asset_models_and_vega(tmp_path):
         tmp_path,
         dashboard_server.DEALS_HTML,
         (
-            "modelStack", "modelCell", "escapeHtml", "dealUiText",
+            "modelStack", "modelCell", "verdictLabel", "escapeHtml", "dealUiText",
             "optionalMoney", "money", "number",
         ),
         r"""
@@ -64,6 +64,9 @@ assert.deepEqual([...weapon.matchAll(/data-model="([^"]+)"/g)].map(match => matc
   ['almaz', 'igor', 'nova', 'vega']);
 assert.match(weapon, /data-model="vega" data-verdict="good"/);
 assert.ok(weapon.includes('Vega'));
+// Verdict codes are shown as readable labels, not raw API values.
+assert.ok(weapon.includes('Profitable'));
+assert.ok(!weapon.includes('</span>good</span>'));
 // New model results must remain visible without changing the expected-model list.
 assert.ok(modelStack({item_kind: 'knife', models: {knives: good, future: good}})
   .includes('data-model="future"'));
