@@ -7,19 +7,59 @@
 """
 from __future__ import annotations
 
+import argparse
+import sys
 import time
+from pathlib import Path
 
 import pandas as pd
 from catboost import CatBoostRegressor
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
 import build_cache
+import evaluate_segments as ES
 import features
 import train as T
-import evaluate_segments as ES
+
+import app_config
 
 CACHE_PATH = build_cache.CACHE_PATH
 
 _FULL_DF_CACHE = {}
+
+
+def resolve_training_accelerator(
+    device: str | None = None,
+    gpu_devices: str | None = None,
+) -> tuple[str, str, str]:
+    """Use the shared config by default and honor its fail-closed GPU policy."""
+
+    uses_config_device = device is None
+    requested = (
+        app_config.get("CS2_TRAINING_DEVICE", "auto")
+        if uses_config_device
+        else str(device)
+    ).strip().lower() or "auto"
+    selected_gpu_devices = (
+        app_config.get("CS2_CUDA_DEVICES", "0")
+        if gpu_devices is None
+        else str(gpu_devices)
+    ).strip() or "0"
+    task_type = T.choose_training_device(requested)
+    if (
+        uses_config_device
+        and app_config.get_bool("CS2_TRAINING_REQUIRE_GPU", False)
+        and task_type != "GPU"
+    ):
+        raise RuntimeError(
+            "GPU training is required by CS2_TRAINING_REQUIRE_GPU, but CatBoost "
+            "could not use CUDA"
+        )
+    return requested, selected_gpu_devices, task_type
 
 
 def get_full_df() -> pd.DataFrame:
@@ -43,7 +83,12 @@ def run_experiment(
     early_stopping_rounds: int = 60,
     seed: int = 42,
     show_diagnostics: bool = True,
+    device: str | None = None,
+    gpu_devices: str | None = None,
 ):
+    _requested_device, gpu_devices, task_type = resolve_training_accelerator(
+        device, gpu_devices
+    )
     df = get_full_df()
     train_df, test_df = T.time_split(df)
 
@@ -67,6 +112,14 @@ def run_experiment(
     print(f"train (подвыборка): {len(train_df)}, test (полный): {len(test_df)}, фичей: {len(feature_cols)}")
 
     t0 = time.time()
+    print(
+        f"device: {'cuda (CatBoost GPU ' + gpu_devices + ')' if task_type == 'GPU' else 'cpu'}"
+    )
+    accelerator = (
+        {"task_type": "GPU", "devices": gpu_devices}
+        if task_type == "GPU"
+        else {"task_type": "CPU"}
+    )
     model = CatBoostRegressor(
         loss_function="MAE",
         iterations=iterations,
@@ -77,6 +130,7 @@ def run_experiment(
         early_stopping_rounds=early_stopping_rounds,
         thread_count=T.THREAD_COUNT,
         verbose=False,
+        **accelerator,
     )
     model.fit(train_pool, eval_set=test_pool, use_best_model=True)
     elapsed = time.time() - t0
@@ -102,5 +156,31 @@ def run_experiment(
     return result
 
 
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Run a short Igor experiment with the configured accelerator"
+    )
+    parser.add_argument("--name", default="baseline fast")
+    parser.add_argument("--train-sample-size", type=int, default=150_000)
+    parser.add_argument("--iterations", type=int, default=1200)
+    parser.add_argument("--depth", type=int, default=6)
+    parser.add_argument("--learning-rate", type=float, default=0.08)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"))
+    parser.add_argument("--gpu-devices")
+    parser.add_argument("--no-diagnostics", action="store_true")
+    args = parser.parse_args(argv)
+    run_experiment(
+        args.name,
+        train_sample_size=args.train_sample_size,
+        iterations=args.iterations,
+        depth=args.depth,
+        learning_rate=args.learning_rate,
+        show_diagnostics=not args.no_diagnostics,
+        device=args.device,
+        gpu_devices=args.gpu_devices,
+    )
+    return 0
+
+
 if __name__ == "__main__":
-    run_experiment("baseline fast (150k sample, depth6, 1200 iter)")
+    raise SystemExit(main())

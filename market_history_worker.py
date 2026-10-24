@@ -287,6 +287,8 @@ def run_loop(settings: WorkerSettings, *, session: Any = None) -> int:
 
     previous_term = signal.signal(signal.SIGTERM, stop_handler)
     previous_int = signal.signal(signal.SIGINT, stop_handler)
+    import windows_service_control
+    windows_service_control.register_stop_callback(stop_event.set)
     started_at = market_history.utc_now()
     last_report: dict[str, Any] | None = None
     try:

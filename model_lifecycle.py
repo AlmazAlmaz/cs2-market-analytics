@@ -19,11 +19,12 @@ from pathlib import Path
 from typing import Any
 
 import app_config
+import portable_os
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - production is macOS/Linux.
-    fcntl = None
+except ImportError:  # Windows
+    import portable_fcntl as fcntl
 
 
 LOCK_FILENAME = "model_runtime.lock"
@@ -85,11 +86,7 @@ def _secure_directory(path: Path, project: Path) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    portable_os.fsync_directory(path)
 
 
 def _open_lock(path: Path) -> int:
@@ -100,7 +97,7 @@ def _open_lock(path: Path) -> int:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
             raise ModelLifecycleError("model lifecycle lock is not a regular file")
-        os.fchmod(descriptor, 0o600)
+        portable_os.fchmod(descriptor, 0o600)
         return descriptor
     except ModelLifecycleError:
         if descriptor is not None:

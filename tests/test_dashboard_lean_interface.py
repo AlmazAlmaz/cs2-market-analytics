@@ -216,6 +216,7 @@ def test_nova_api_and_deal_comparison_remain_available(monkeypatch, tmp_path):
 
     rendered = dashboard_server.render_private_html(dashboard_server.DEAL_HTML, "en")
     assert 'id="modelComparisonGrid"' in rendered
-    assert "['almaz', 'igor', 'nova']" in rendered
+    assert "['almaz', 'igor', 'nova', 'vega']" in rendered
+    assert "Vega (advisory)" in rendered
     assert "/api/predict-deal?" in rendered
     assert 'href="/neural"' not in _lean_nav(rendered)

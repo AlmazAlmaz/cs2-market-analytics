@@ -150,7 +150,30 @@ _COPY = {
         "revoke_sessionsDone": "Все сессии пользователя завершены.",
         "send_password_resetDone": "Запрос на сброс пароля отправлен.",
         "deleteDone": "Учётная запись удалена.",
-        "autoRefresh": "Онлайн-статус обновляется автоматически каждые 20 секунд.",
+        "autoRefresh": "Активность и скачивания обновляются каждые 2 секунды.",
+        "downloading": "Активные скачивания БД",
+        "downloadingOnly": "Сейчас скачивают БД",
+        "downloads": "Скачивания базы данных",
+        "downloadActive": "Сейчас скачивает · {count}",
+        "downloadIdle": "Сейчас не скачивает",
+        "downloadTotal": "Всего передано, включая неполные скачивания",
+        "downloadCompleted": "Завершено скачиваний",
+        "downloadHistory": "Последние скачивания",
+        "downloadNone": "Скачиваний пока не зарегистрировано",
+        "downloadPreparing": "Подготовка файла",
+        "downloadDownloading": "Скачивается",
+        "downloadCompletedState": "Завершено",
+        "downloadInterrupted": "Прервано",
+        "downloadFailed": "Ошибка",
+        "downloadStarted": "Начало",
+        "downloadFinished": "Окончание",
+        "downloadUpdated": "Обновлено",
+        "downloadProgress": "Передано {sent} из {total} · {percent}%",
+        "downloadProgressUnknown": "Передано {sent} · размер уточняется",
+        "downloadProgressLabel": "Передача базы данных",
+        "downloadHint": "Показан объём, переданный сервером; он может отличаться от сохранённого на устройстве. Скачивания до включения учёта недоступны.",
+        "keyDownloads": "Скачивания по ключу доступа",
+        "keyDownloadsHint": "Эти скачивания не связаны с учётной записью. Источник указан по IP.",
         "noSecret": "Пароли, хеши и cookie не отображаются; одноразовая ссылка сброса показывается только сразу после запроса.",
         "resetLinkTitle": "Одноразовая ссылка сброса",
         "resetLinkLead": "Почта не доставила письмо. Передайте эту ссылку пользователю безопасным способом. После закрытия окна она исчезнет.",
@@ -266,7 +289,30 @@ _COPY = {
         "revoke_sessionsDone": "All user sessions ended.",
         "send_password_resetDone": "Password reset request sent.",
         "deleteDone": "Account deleted.",
-        "autoRefresh": "Online status refreshes automatically every 20 seconds.",
+        "autoRefresh": "Activity and downloads refresh every 2 seconds.",
+        "downloading": "Active database downloads",
+        "downloadingOnly": "Downloading database now",
+        "downloads": "Database downloads",
+        "downloadActive": "Downloading now · {count}",
+        "downloadIdle": "Not downloading now",
+        "downloadTotal": "Total transferred, including partial downloads",
+        "downloadCompleted": "Completed downloads",
+        "downloadHistory": "Recent downloads",
+        "downloadNone": "No downloads recorded yet",
+        "downloadPreparing": "Preparing file",
+        "downloadDownloading": "Downloading",
+        "downloadCompletedState": "Completed",
+        "downloadInterrupted": "Interrupted",
+        "downloadFailed": "Failed",
+        "downloadStarted": "Started",
+        "downloadFinished": "Finished",
+        "downloadUpdated": "Updated",
+        "downloadProgress": "Transferred {sent} of {total} · {percent}%",
+        "downloadProgressUnknown": "Transferred {sent} · size pending",
+        "downloadProgressLabel": "Database transfer",
+        "downloadHint": "Bytes are recorded as sent by the server and may differ from the file saved on the device. Downloads before tracking was enabled are unavailable.",
+        "keyDownloads": "Downloads using an access key",
+        "keyDownloadsHint": "These downloads are not linked to an account. Their source is shown by IP.",
         "noSecret": "Passwords, hashes, and cookies are hidden; a one-time reset link appears only immediately after a request.",
         "resetLinkTitle": "One-time reset link",
         "resetLinkLead": "Email delivery was unavailable. Share this link with the user through a safe channel. It disappears when this dialog closes.",
@@ -293,6 +339,7 @@ _HTML = r"""<!doctype html>
     .summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:11px;margin-bottom:17px}.metric{min-width:0;padding:16px;border:1px solid var(--line);border-radius:16px;background:linear-gradient(150deg,rgba(22,29,43,.97),rgba(14,19,29,.97));box-shadow:var(--shadow)}.metric span{display:block;color:var(--muted);font-size:11px}.metric strong{display:block;margin-top:7px;font-size:25px;line-height:1;letter-spacing:-.035em}.metric[data-kind=pending] strong{color:var(--warn)}.metric[data-kind=approved] strong,.metric[data-kind=online] strong{color:var(--accent)}.metric[data-kind=blocked] strong{color:var(--bad)}
     .panel{min-width:0;border:1px solid var(--line);border-radius:18px;background:linear-gradient(150deg,rgba(20,27,40,.97),rgba(13,18,28,.98));box-shadow:var(--shadow)}.toolbar{display:grid;grid-template-columns:minmax(220px,1fr) minmax(155px,190px) minmax(170px,210px);gap:9px;padding:15px;border-bottom:1px solid var(--line)}input,select{min-width:0;width:100%;padding:10px 11px;border:1px solid var(--line);border-radius:11px;outline:0;color:var(--text);background:rgba(5,8,14,.7)}input:focus,select:focus{border-color:rgba(99,215,255,.55);box-shadow:0 0 0 3px rgba(99,215,255,.08)}.tabs{display:flex;gap:6px;padding:0 15px 14px;overflow:auto;border-bottom:1px solid var(--line)}.tab{padding:7px 10px;border:1px solid var(--line);border-radius:999px;color:var(--muted);background:transparent;cursor:pointer;white-space:nowrap}.tab.active{color:#081009;border-color:transparent;background:var(--accent);font-weight:850}.list-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:13px 15px;color:var(--muted);font-size:11px}.hints{display:flex;gap:13px;flex-wrap:wrap;justify-content:flex-end}
     .users-list{display:grid;gap:9px;padding:0 15px 15px}.user-card{min-width:0;padding:15px;border:1px solid var(--line);border-radius:15px;background:rgba(5,8,14,.34)}.user-main{display:grid;grid-template-columns:minmax(220px,1.15fr) minmax(175px,.8fr) minmax(210px,1fr) minmax(210px,.95fr);gap:18px;align-items:start}.identity{min-width:0;display:grid;grid-template-columns:42px minmax(0,1fr);gap:10px}.avatar{width:42px;height:42px;display:grid;place-items:center;border-radius:12px;color:#071108;background:linear-gradient(135deg,var(--accent),#5edda2);font-weight:900}.identity h2{overflow-wrap:anywhere;margin:0 0 2px;font-size:15px;letter-spacing:-.015em}.email{overflow-wrap:anywhere;color:var(--muted);font-size:12px}.chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}.chip{padding:3px 7px;border-radius:999px;color:var(--muted);background:rgba(255,255,255,.055);font-size:10px}.chip.status-pending{color:#211704;background:var(--warn);font-weight:850}.chip.status-approved,.chip.online{color:#071108;background:var(--accent);font-weight:850}.chip.status-blocked,.chip.status-deleted{color:#21070b;background:var(--bad);font-weight:850}.column{min-width:0}.column-title{display:block;margin-bottom:7px;color:var(--muted);font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.fact{min-width:0;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;padding:3px 0;font-size:11px}.fact span{color:var(--muted)}.fact strong{max-width:180px;overflow-wrap:anywhere;text-align:right;font-weight:700}.ua{display:-webkit-box;overflow:hidden;-webkit-box-orient:vertical;-webkit-line-clamp:2;margin-top:5px;color:var(--muted);font-size:10px;overflow-wrap:anywhere}.card-footer{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-top:13px;padding-top:12px;border-top:1px solid var(--line)}.activity-line{color:var(--muted);font-size:11px}.activity-line strong{color:var(--text)}.actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px}.actions .button{min-height:34px;padding:0 10px;font-size:10px}.sessions{margin-top:11px;border:1px solid var(--line);border-radius:11px;background:rgba(255,255,255,.015)}.sessions summary{padding:10px 11px;color:var(--muted);font-size:11px;font-weight:750;cursor:pointer}.session-list{display:grid;gap:0;padding:0 11px 10px}.session{display:grid;grid-template-columns:minmax(120px,.7fr) minmax(170px,1fr) minmax(180px,1.3fr);gap:10px;padding:8px 0;border-top:1px solid var(--line);font-size:10px}.session>*{min-width:0;overflow-wrap:anywhere}.session-state{font-weight:800}.session-state.active{color:var(--accent)}.empty{padding:48px 18px;text-align:center;color:var(--muted)}.empty strong{display:block;margin-bottom:4px;color:var(--text);font-size:15px}.skeleton{height:148px;border-radius:14px;background:linear-gradient(90deg,rgba(255,255,255,.025),rgba(255,255,255,.07),rgba(255,255,255,.025));background-size:220% 100%;animation:pulse 1.3s linear infinite}@keyframes pulse{to{background-position:-220% 0}}
+    .summary{grid-template-columns:repeat(6,minmax(0,1fr))}.metric[data-kind=downloading] strong{color:var(--cyan)}.downloads{margin-top:13px;padding:12px;border:1px solid var(--line);border-radius:12px;background:rgba(99,215,255,.025)}.downloads-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.downloads-heading h3{margin:0;font-size:12px}.download-active,.download-state[data-state=downloading]{color:var(--cyan)}.download-state[data-state=preparing]{color:var(--warn)}.download-state[data-state=completed]{color:var(--accent)}.download-state[data-state=interrupted],.download-state[data-state=failed]{color:var(--bad)}.download-totals{display:flex;gap:8px 25px;flex-wrap:wrap;margin:8px 0;color:var(--muted);font-size:11px}.download-totals strong{color:var(--text)}.download-row{min-width:0;padding:9px 0;border-top:1px solid var(--line);font-size:11px;overflow-wrap:anywhere}.download-row-head{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap}.download-state{font-weight:800}.download-progress{width:100%;height:7px;margin:7px 0;accent-color:var(--cyan)}.download-meta,.download-filename{margin-top:4px;color:var(--muted);font-size:10px}.download-hint{margin:12px 0 17px;color:var(--muted);font-size:11px}.key-downloads{padding:15px;margin-top:17px}.key-downloads h2{margin:0;font-size:17px}.key-downloads .downloads{margin-top:10px}.key-downloads[hidden]{display:none}
     dialog{width:min(480px,calc(100% - 24px));padding:0;border:1px solid var(--line);border-radius:20px;color:var(--text);background:var(--panel2);box-shadow:0 30px 100px #000}dialog::backdrop{background:rgba(0,0,0,.72);backdrop-filter:blur(4px)}.dialog-body{padding:22px}.dialog-body h2{margin:0 0 8px;font-size:20px}.dialog-body p{margin:0 0 15px;color:var(--muted)}.confirm-field{display:grid;gap:6px;margin-bottom:15px;color:var(--muted);font-size:11px}.dialog-actions{display:flex;gap:8px;justify-content:flex-end}.dialog-actions .button{min-width:110px}.reset-link-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;margin:13px 0}.reset-link-row input{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.sensitive-note{padding:10px;border:1px solid rgba(255,199,104,.24);border-radius:10px;color:var(--warn)!important;background:rgba(255,199,104,.045);font-size:11px}
     @media(max-width:1120px){.summary{grid-template-columns:repeat(3,1fr)}.user-main{grid-template-columns:minmax(210px,1fr) minmax(180px,.85fr) minmax(210px,1fr)}.user-main>.column:last-child{grid-column:2/-1}.session{grid-template-columns:1fr 1fr}.session>*:last-child{grid-column:1/-1}}
     @media(max-width:760px){.wrap{width:min(100% - 20px,1440px)}.topbar{flex-wrap:wrap;gap:9px;padding:11px 0}.brand{font-size:15px}nav{order:3;width:100%;flex-basis:100%}.locale span{display:none}.hero{align-items:flex-start;flex-direction:column}.hero-actions{justify-content:flex-start}.summary{grid-template-columns:1fr 1fr}.toolbar{grid-template-columns:1fr 1fr}.toolbar input{grid-column:1/-1}.user-main{grid-template-columns:1fr 1fr}.user-main>.identity{grid-column:1/-1}.user-main>.column:last-child{grid-column:auto}.card-footer{align-items:flex-start;flex-direction:column}.actions{justify-content:flex-start}.hints{display:none}}
@@ -314,18 +361,25 @@ _HTML = r"""<!doctype html>
       <article class="metric" data-kind="approved"><span data-i18n="approved"></span><strong id="metricApproved">—</strong></article>
       <article class="metric" data-kind="blocked"><span data-i18n="blocked"></span><strong id="metricBlocked">—</strong></article>
       <article class="metric" data-kind="online"><span data-i18n="online"></span><strong id="metricOnline">—</strong></article>
+      <article class="metric" data-kind="downloading"><span data-i18n="downloading"></span><strong id="metricDownloading">—</strong></article>
     </section>
+    <p class="download-hint" data-i18n="downloadHint"></p>
     <section class="panel">
       <div class="toolbar">
         <input id="searchInput" type="search" autocomplete="off" data-i18n-placeholder="search" data-i18n-aria-label="searchLabel">
-        <select id="activityFilter" data-i18n-aria-label="activity"><option value="all" data-i18n="allActivity"></option><option value="online" data-i18n="onlineOnly"></option><option value="offline" data-i18n="offlineOnly"></option></select>
+        <select id="activityFilter" data-i18n-aria-label="activity"><option value="all" data-i18n="allActivity"></option><option value="online" data-i18n="onlineOnly"></option><option value="offline" data-i18n="offlineOnly"></option><option value="downloading" data-i18n="downloadingOnly"></option></select>
         <select id="sortSelect" data-i18n-aria-label="sort"><option value="seen" data-i18n="recentlySeen"></option><option value="newest" data-i18n="newest"></option><option value="oldest" data-i18n="oldest"></option></select>
       </div>
       <div class="tabs" id="statusTabs" role="tablist" aria-label="Access status">
         <button class="tab active" type="button" data-status="all" data-i18n="all"></button><button class="tab" type="button" data-status="pending" data-i18n="pending"></button><button class="tab" type="button" data-status="approved" data-i18n="approved"></button><button class="tab" type="button" data-status="blocked" data-i18n="blocked"></button><button class="tab" type="button" data-status="deleted" data-i18n="deleted"></button>
       </div>
       <div class="list-head"><strong id="resultCount">—</strong><div class="hints"><span data-i18n="autoRefresh"></span><span data-i18n="noSecret"></span></div></div>
-      <div class="users-list" id="usersList" aria-live="polite"><div class="skeleton"></div><div class="skeleton"></div></div>
+      <div class="users-list" id="usersList"><div class="skeleton"></div><div class="skeleton"></div></div>
+    </section>
+    <section class="panel key-downloads" id="keyDownloadsPanel" aria-labelledby="keyDownloadsTitle" hidden>
+      <h2 id="keyDownloadsTitle" data-i18n="keyDownloads"></h2>
+      <p class="download-hint" data-i18n="keyDownloadsHint"></p>
+      <div id="keyDownloadsList"></div>
     </section>
   </main>
   <dialog id="confirmDialog" aria-labelledby="confirmTitle">
@@ -353,6 +407,9 @@ _HTML = r"""<!doctype html>
     const ONLINE_WINDOW_SECONDS=300;
     let locale='__LOCALE__';
     let users=[];
+    let unattributedDownloads={};
+    let loadingPromise=null;
+    const openDetails=new Set();
     let statusFilter='all';
     let pendingAction=null;
     let autoRefreshId=null;
@@ -363,7 +420,7 @@ _HTML = r"""<!doctype html>
     function cookieValue(name){const prefix=`${name}=`;for(const part of document.cookie.split(';')){const value=part.trim();if(value.startsWith(prefix))return value.slice(prefix.length)}return ''}
     function storedLocale(){let cookie='';try{cookie=decodeURIComponent(cookieValue('cs2_locale'))}catch(_){}let local='';try{local=localStorage.getItem('cs2_locale')||''}catch(_){}const preferred=cookie||local||locale;return VALID_LOCALES.has(preferred)?preferred:'ru'}
     function persistLocale(value){document.cookie=`cs2_locale=${encodeURIComponent(value)}; Path=/; Max-Age=31536000; SameSite=Lax${location.protocol==='https:'?'; Secure':''}`;try{localStorage.setItem('cs2_locale',value)}catch(_){}}
-    function applyLocale(value,persist=false){locale=VALID_LOCALES.has(value)?value:'ru';document.documentElement.lang=locale;document.title=tr('documentTitle');document.querySelectorAll('[data-i18n]').forEach(node=>{node.textContent=tr(node.dataset.i18n)});document.querySelectorAll('[data-i18n-placeholder]').forEach(node=>{node.placeholder=tr(node.dataset.i18nPlaceholder)});document.querySelectorAll('[data-i18n-aria-label]').forEach(node=>{node.setAttribute('aria-label',tr(node.dataset.i18nAriaLabel))});byId('localeSelect').value=locale;if(persist)persistLocale(locale);renderUsers()}
+    function applyLocale(value,persist=false){locale=VALID_LOCALES.has(value)?value:'ru';document.documentElement.lang=locale;document.title=tr('documentTitle');document.querySelectorAll('[data-i18n]').forEach(node=>{node.textContent=tr(node.dataset.i18n)});document.querySelectorAll('[data-i18n-placeholder]').forEach(node=>{node.placeholder=tr(node.dataset.i18nPlaceholder)});document.querySelectorAll('[data-i18n-aria-label]').forEach(node=>{node.setAttribute('aria-label',tr(node.dataset.i18nAriaLabel))});byId('localeSelect').value=locale;if(persist)persistLocale(locale);renderUsers();renderKeyDownloads()}
     function node(tag,className,textValue){const element=document.createElement(tag);if(className)element.className=className;if(textValue!==undefined)element.textContent=safeString(textValue);return element}
     function append(parent,...children){children.forEach(child=>parent.appendChild(child));return parent}
     function setNotice(message,tone=''){const target=byId('notice');target.textContent=message;target.dataset.tone=tone}
@@ -372,6 +429,39 @@ _HTML = r"""<!doctype html>
     function dateValue(value){if(!value)return null;const date=new Date(value);return Number.isNaN(date.getTime())?null:date}
     function formatDate(value){const date=dateValue(value);return date?new Intl.DateTimeFormat(locale==='ru'?'ru-RU':'en-US',{dateStyle:'medium',timeStyle:'short'}).format(date):'—'}
     function formatCount(value){return new Intl.NumberFormat(locale==='ru'?'ru-RU':'en-US').format(Math.max(0,safeNumber(value)))}
+    function formatBytes(value){const bytes=Math.max(0,safeNumber(value));const units=['B','KiB','MiB','GiB','TiB'];const unit=bytes>0?Math.min(units.length-1,Math.floor(Math.log(bytes)/Math.log(1024))):0;return `${new Intl.NumberFormat(locale==='ru'?'ru-RU':'en-US',{maximumFractionDigits:unit?1:0}).format(bytes/(1024**unit))} ${units[unit]}`}
+    function downloadStats(value){const data=value&&typeof value==='object'?value:{};return {active:Math.max(0,safeNumber(data.active_count)),bytes:Math.max(0,safeNumber(data.total_bytes)),completed:Math.max(0,safeNumber(data.completed_count)),recent:Array.isArray(data.recent)?data.recent.filter(item=>item&&typeof item==='object'):[]}}
+    function isActiveDownload(download){return download.status==='preparing'||download.status==='downloading'}
+    function rememberDetails(target){target.querySelectorAll('details[data-detail-key]').forEach(details=>{if(details.open)openDetails.add(details.dataset.detailKey);else openDetails.delete(details.dataset.detailKey)})}
+    function persistentDetails(details,key){details.dataset.detailKey=key;details.open=openDetails.has(key);return details}
+    function downloadRow(download){
+      const states={preparing:'downloadPreparing',downloading:'downloadDownloading',completed:'downloadCompletedState',interrupted:'downloadInterrupted',failed:'downloadFailed'};
+      const status=Object.hasOwn(states,download.status)?download.status:'unknown';
+      const sent=Math.max(0,safeNumber(download.bytes_sent)),total=Math.max(0,safeNumber(download.total_bytes));
+      const known=total>0||status==='completed';
+      const percent=total>0?Math.min(100,Math.round(sent/total*1000)/10):status==='completed'?100:0;
+      const row=node('div','download-row');row.dataset.downloadId=safeString(download.id,100);
+      const header=node('div','download-row-head'),state=node('span','download-state',tr(states[status]||'unknown'));state.dataset.state=status;
+      const progressText=tr(known?'downloadProgress':'downloadProgressUnknown',{sent:formatBytes(sent),total:formatBytes(total),percent:formatCount(percent)});
+      const label=node('span','',progressText);label.title=`${formatCount(sent)} B / ${known?`${formatCount(total)} B`:'—'}`;append(header,state,label);append(row,header);
+      if(known||isActiveDownload(download)){const progress=node('progress','download-progress');progress.max=100;if(known)progress.value=percent;progress.setAttribute('aria-label',`${tr('downloadProgressLabel')}: ${progressText}`);append(row,progress)}
+      const filename=safeString(download.filename,255);if(filename)append(row,node('div','download-filename',filename));
+      const endLabel=download.finished_at?'downloadFinished':'downloadUpdated';
+      append(row,node('div','download-meta',`${tr('downloadStarted')}: ${formatDate(download.started_at)} · ${tr(endLabel)}: ${formatDate(download.finished_at||download.updated_at)} · IP: ${safeString(download.ip_address,80)||'—'}`));
+      return row;
+    }
+    function downloadsBlock(value,key){
+      const stats=downloadStats(value),wrapper=node('section','downloads'),header=node('div','downloads-heading');
+      append(header,node('h3','',tr('downloads')),node('span',stats.active?'download-active':'activity-line',stats.active?tr('downloadActive',{count:formatCount(stats.active)}):tr('downloadIdle')));append(wrapper,header);
+      const totals=node('div','download-totals'),bytes=node('span',''),completed=node('span','');
+      const totalBytes=node('strong','',formatBytes(stats.bytes));totalBytes.title=`${formatCount(stats.bytes)} B`;
+      append(bytes,document.createTextNode(`${tr('downloadTotal')}: `),totalBytes);append(completed,document.createTextNode(`${tr('downloadCompleted')}: `),node('strong','',formatCount(stats.completed)));append(totals,bytes,completed);append(wrapper,totals);
+      const active=stats.recent.filter(isActiveDownload);const visible=active.length?active:stats.recent.slice(0,1);
+      if(!visible.length)append(wrapper,node('div','activity-line',tr(stats.active?'downloadPreparing':'downloadNone')));else visible.forEach(download=>append(wrapper,downloadRow(download)));
+      if(stats.recent.length){const details=persistentDetails(node('details','sessions'),`${key}:downloads`);append(details,node('summary','',`${tr('downloadHistory')} · ${formatCount(stats.recent.length)}`));const list=node('div','session-list');stats.recent.forEach(download=>append(list,downloadRow(download)));append(details,list);append(wrapper,details)}
+      return wrapper;
+    }
+    function renderKeyDownloads(){const target=byId('keyDownloadsList');if(!target)return;rememberDetails(target);const stats=downloadStats(unattributedDownloads);byId('keyDownloadsPanel').hidden=!(stats.recent.length||stats.active||stats.bytes||stats.completed);target.replaceChildren();append(target,downloadsBlock(unattributedDownloads,'access-key'))}
     function resultLabel(count){if(locale==='en')return tr(count===1?'resultOne':'resultMany',{count});const mod10=count%10,mod100=count%100;const key=mod10===1&&mod100!==11?'resultOne':mod10>=2&&mod10<=4&&(mod100<12||mod100>14)?'resultFew':'resultMany';return tr(key,{count})}
     function countryOf(value){if(value&&typeof value==='object')return safeString(value.name||value.country_name||value.code||value.country_code,100)||tr('unknown');return safeString(value,100)||tr('unknown')}
     function userIp(user,kind){if(kind==='current')return safeString(user.current_ip||user.current_ip_address||user.ip_address,80);if(kind==='registration')return safeString(user.registration_ip||user.registration_ip_address,80);return safeString(user.last_ip||user.last_ip_address||user.ip_address,80)}
@@ -386,13 +476,26 @@ _HTML = r"""<!doctype html>
     function sessionDetails(user){const sessions=Array.isArray(user.recent_sessions)?user.recent_sessions:Array.isArray(user.sessions)?user.sessions:[];const details=node('details','sessions');const summary=node('summary','',`${tr('sessionsTitle')} · ${sessions.length}`);append(details,summary);const list=node('div','session-list');if(!sessions.length){append(list,node('div','activity-line',tr('noSessions')))}else sessions.slice(0,8).forEach(session=>{const row=node('div','session');const active=session.is_active===true&&!session.revoked_at;append(row,node('span',`session-state${active?' active':''}`,tr(active?'sessionActive':'sessionEnded')),node('span','',`${safeString(session.ip||session.ip_address,80)||'—'} · ${countryOf(session.country||session.country_name||session.country_code)}`),node('span','',`${tr('sessionCreated')}: ${formatDate(session.created_at)} · ${tr('lastSeen')}: ${formatDate(session.last_seen_at)} · ${tr('sessionExpires')}: ${formatDate(session.expires_at)} · ${safeString(session.user_agent,280)||tr('unknown')}`));append(list,row)});append(details,list);return details}
     function actionButton(action,label,user,tone=''){const button=node('button',`button${tone?` ${tone}`:''}`,label);button.type='button';button.dataset.action=action;button.disabled=user.can_manage===false||(user.is_self===true&&(action==='block'||action==='delete'));button.addEventListener('click',()=>openConfirmation(action,user));return button}
     function actionsBlock(user){const wrapper=node('div','actions');const state=stateOf(user);if(state==='deleted')return wrapper;if(state!=='approved')append(wrapper,actionButton('approve',tr('approve'),user,'primary'));if(state==='approved')append(wrapper,actionButton('block',tr('block'),user,'danger'));if(user.role==='admin')append(wrapper,actionButton('revoke_admin',tr('revokeAdmin'),user,'danger'));else if(state==='approved')append(wrapper,actionButton('grant_admin',tr('grantAdmin'),user));append(wrapper,actionButton('revoke_sessions',tr('revokeSessions'),user),actionButton('send_password_reset',tr('sendReset'),user),actionButton('delete',tr('deleteAccount'),user,'danger'));return wrapper}
-    function userCard(user){const card=node('article','user-card');card.dataset.userId=safeString(user.id,100);const main=node('div','user-main');append(main,identityBlock(user),activityColumn(user),networkColumn(user),accountColumn(user));const footer=node('div','card-footer');const activity=node('div','activity-line');const label=node('strong','',isOnline(user)?tr('onlineNow'):tr('lastSeen'));append(activity,label,document.createTextNode(` · ${formatDate(user.last_seen_at)}`));append(footer,activity,actionsBlock(user));append(card,main,sessionDetails(user),footer);return card}
+    function userCard(user){const card=node('article','user-card');card.dataset.userId=safeString(user.id,100);const main=node('div','user-main');append(main,identityBlock(user),activityColumn(user),networkColumn(user),accountColumn(user));const footer=node('div','card-footer');const activity=node('div','activity-line');const label=node('strong','',isOnline(user)?tr('onlineNow'):tr('lastSeen'));append(activity,label,document.createTextNode(` · ${formatDate(user.last_seen_at)}`));append(footer,activity,actionsBlock(user));append(card,main,downloadsBlock(user.database_downloads,`user:${card.dataset.userId}`),persistentDetails(sessionDetails(user),`user:${card.dataset.userId}:sessions`),footer);return card}
     function searchable(user){return [user.id,user.email,user.display_name,user.name,userIp(user,'current'),userIp(user,'last'),userIp(user,'registration'),countryOf(userCountry(user)),user.current_user_agent,user.last_user_agent].map(value=>safeString(value,500).toLocaleLowerCase(locale==='ru'?'ru-RU':'en-US')).join(' ')}
-    function filteredUsers(){const query=safeString(byId('searchInput').value,300).toLocaleLowerCase(locale==='ru'?'ru-RU':'en-US');const activity=byId('activityFilter').value;const sort=byId('sortSelect').value;const result=users.filter(user=>(statusFilter==='all'||stateOf(user)===statusFilter)&&(!query||searchable(user).includes(query))&&(activity==='all'||(activity==='online')===isOnline(user)));const timestamp=(user,key)=>dateValue(user[key])?.getTime()||0;result.sort((a,b)=>sort==='oldest'?timestamp(a,'created_at')-timestamp(b,'created_at'):sort==='newest'?timestamp(b,'created_at')-timestamp(a,'created_at'):timestamp(b,'last_seen_at')-timestamp(a,'last_seen_at'));return result}
-    function renderUsers(){if(!byId('usersList'))return;const target=byId('usersList');target.replaceChildren();const result=filteredUsers();byId('resultCount').textContent=resultLabel(result.length);if(!result.length){const empty=node('div','empty');append(empty,node('strong','',tr('emptyTitle')),node('span','',tr('emptyLead')));append(target,empty);return}result.forEach(user=>append(target,userCard(user)))}
-    function updateSummary(serverSummary={}){const counts={total:users.length,pending:0,approved:0,blocked:0,online:0};users.forEach(user=>{const state=stateOf(user);if(Object.hasOwn(counts,state))counts[state]+=1;if(isOnline(user))counts.online+=1});for(const key of Object.keys(counts)){const serverValue=serverSummary[key]??serverSummary[`${key}_count`];const value=Number.isFinite(Number(serverValue))?Number(serverValue):counts[key];const target=byId(`metric${key[0].toUpperCase()}${key.slice(1)}`);if(target)target.textContent=formatCount(value)}}
+    function filteredUsers(){const query=safeString(byId('searchInput').value,300).toLocaleLowerCase(locale==='ru'?'ru-RU':'en-US');const activity=byId('activityFilter').value;const sort=byId('sortSelect').value;const result=users.filter(user=>(statusFilter==='all'||stateOf(user)===statusFilter)&&(!query||searchable(user).includes(query))&&(activity==='all'||(activity==='downloading'?downloadStats(user.database_downloads).active>0:(activity==='online')===isOnline(user))));const timestamp=(user,key)=>dateValue(user[key])?.getTime()||0;result.sort((a,b)=>sort==='oldest'?timestamp(a,'created_at')-timestamp(b,'created_at'):sort==='newest'?timestamp(b,'created_at')-timestamp(a,'created_at'):timestamp(b,'last_seen_at')-timestamp(a,'last_seen_at'));return result}
+    function renderUsers(){
+      if(!byId('usersList'))return;const target=byId('usersList');rememberDetails(target);
+      const focused=document.activeElement,focusedCard=focused?.closest('.user-card');
+      const focus=focusedCard?{userId:focusedCard.dataset.userId,action:focused.dataset.action,detailKey:focused.closest('details')?.dataset.detailKey}:null;
+      target.replaceChildren();const result=filteredUsers();byId('resultCount').textContent=resultLabel(result.length);
+      if(!result.length){const empty=node('div','empty');append(empty,node('strong','',tr('emptyTitle')),node('span','',tr('emptyLead')));append(target,empty);return}
+      result.forEach(user=>append(target,userCard(user)));
+      if(focus){const card=Array.from(target.querySelectorAll('.user-card')).find(item=>item.dataset.userId===focus.userId);const control=focus.action?Array.from(card?.querySelectorAll('[data-action]')||[]).find(item=>item.dataset.action===focus.action):Array.from(card?.querySelectorAll('details')||[]).find(item=>item.dataset.detailKey===focus.detailKey)?.querySelector('summary');control?.focus({preventScroll:true})}
+    }
+    function updateSummary(serverSummary={}){const counts={total:users.length,pending:0,approved:0,blocked:0,online:0,downloading:downloadStats(unattributedDownloads).active};users.forEach(user=>{const state=stateOf(user);if(Object.hasOwn(counts,state))counts[state]+=1;if(isOnline(user))counts.online+=1;counts.downloading+=downloadStats(user.database_downloads).active});for(const key of Object.keys(counts)){const serverValue=serverSummary[key]??serverSummary[`${key}_count`];const value=Number.isFinite(Number(serverValue))?Number(serverValue):counts[key];const target=byId(`metric${key[0].toUpperCase()}${key.slice(1)}`);if(target)target.textContent=formatCount(value)}}
     function safeError(payload,status){const code=safeString(payload?.error_code||payload?.code,80).toLowerCase();if(status===403)return code==='local_only'||code==='local_required'?tr('localRequired'):tr('forbidden');if(status===409)return tr('conflict');if(code==='smtp_not_configured')return tr('smtpMissing');return tr('requestFailed')}
-    async function loadUsers({quiet=false}={}){const refresh=byId('refreshButton');refresh.disabled=true;if(!quiet)refresh.textContent=tr('refreshing');try{const response=await fetch(API_ENDPOINT,{credentials:'same-origin',headers:{Accept:'application/json','X-CS2-Action':'admin-users-read'}});const payload=await response.json().catch(()=>({}));if(!response.ok)throw Object.assign(new Error(safeError(payload,response.status)),{safe:true,status:response.status});users=Array.isArray(payload.users)?payload.users.filter(user=>user&&typeof user==='object'):[];updateSummary(payload.summary&&typeof payload.summary==='object'?payload.summary:{});renderUsers();if(!quiet)setNotice(tr('loaded'),'good')}catch(error){setNotice(error?.safe?error.message:tr('loadFailed'),'bad');if(!users.length){users=[];updateSummary();renderUsers()}}finally{refresh.disabled=false;refresh.textContent=tr('refresh')}}
+    function loadUsers({quiet=false}={}){
+      if(loadingPromise)return loadingPromise;
+      loadingPromise=(async()=>{const refresh=byId('refreshButton');refresh.disabled=true;if(!quiet)refresh.textContent=tr('refreshing');try{const response=await fetch(API_ENDPOINT,{credentials:'same-origin',headers:{Accept:'application/json','X-CS2-Action':'admin-users-read'}});const payload=await response.json().catch(()=>({}));if(!response.ok)throw Object.assign(new Error(safeError(payload,response.status)),{safe:true,status:response.status});users=Array.isArray(payload.users)?payload.users.filter(user=>user&&typeof user==='object'):[];unattributedDownloads=payload.unattributed_downloads||{};updateSummary(payload.summary&&typeof payload.summary==='object'?payload.summary:{});renderUsers();renderKeyDownloads();if(!quiet)setNotice(tr('loaded'),'good')}catch(error){setNotice(error?.safe?error.message:tr('loadFailed'),'bad');if(!users.length){users=[];updateSummary();renderUsers()}}finally{refresh.disabled=false;refresh.textContent=tr('refresh')}})().finally(()=>{loadingPromise=null});
+      return loadingPromise;
+    }
+    async function refreshAfterAction(){if(loadingPromise)await loadingPromise;await loadUsers({quiet:true})}
     function openConfirmation(action,user){if(!ACTIONS.has(action)||!user)return;pendingAction={action,user};const messages={approve:'approveConfirm',block:'blockConfirm',grant_admin:'grantAdminConfirm',revoke_admin:'revokeAdminConfirm',revoke_sessions:'revokeConfirm',send_password_reset:'resetConfirm',delete:'deleteConfirm'};byId('confirmMessage').textContent=tr(messages[action]);const isDelete=action==='delete';byId('confirmField').hidden=!isDelete;byId('confirmInput').value='';byId('confirmInput').placeholder=safeString(user.email,254);byId('submitConfirm').disabled=isDelete;byId('submitConfirm').className=`button ${action==='delete'||action==='block'||action==='revoke_admin'?'danger':'primary'}`;byId('confirmDialog').showModal();if(isDelete)byId('confirmInput').focus()}
     function closeConfirmation(){pendingAction=null;if(byId('confirmDialog').open)byId('confirmDialog').close()}
     function safeResetUrl(value){const raw=safeString(value,2200);if(!raw)return'';try{const parsed=new URL(raw,location.origin);return parsed.protocol==='https:'||parsed.protocol==='http:'?parsed.href:''}catch(_){return''}}
@@ -400,7 +503,7 @@ _HTML = r"""<!doctype html>
     function closeResetLink(){byId('resetLinkValue').value='';if(byId('resetLinkDialog').open)byId('resetLinkDialog').close()}
     async function copyResetLink(){const value=byId('resetLinkValue').value;if(!value)return;let copied=false;try{await navigator.clipboard.writeText(value);copied=true}catch(_){byId('resetLinkValue').select();copied=document.execCommand('copy')}if(copied)byId('copyResetLink').textContent=tr('copied')}
     function mutationHeaders(){const headers={'Content-Type':'application/json','Accept':'application/json','X-CS2-Action':'admin-user-management'};let csrf='';try{csrf=decodeURIComponent(cookieValue('cs2_csrf'))}catch(_){}if(csrf)headers['X-CSRF-Token']=csrf;return headers}
-    async function performAction(){if(!pendingAction)return;const {action,user}=pendingAction;const button=byId('submitConfirm');button.disabled=true;button.textContent=tr('working');const requestBody={action,user_id:user.id,expected_revision:safeNumber(user.revision)};if(action==='delete')requestBody.confirmation_email=safeString(byId('confirmInput').value,254);try{const response=await fetch(API_ENDPOINT,{method:'POST',credentials:'same-origin',headers:mutationHeaders(),body:JSON.stringify(requestBody)});const payload=await response.json().catch(()=>({}));if(!response.ok)throw Object.assign(new Error(safeError(payload,response.status)),{safe:true,status:response.status});closeConfirmation();const manualReset=action==='send_password_reset'&&showResetLink(payload.reset_url);const deliveryUnavailable=payload.delivery_configured===false||payload.email_sent===false||payload.delivery_status==='unavailable';setNotice(manualReset?tr('resetManualReady'):deliveryUnavailable?tr('smtpMissing'):tr(`${action}Done`),manualReset?'good':deliveryUnavailable?'bad':'good');await loadUsers({quiet:true})}catch(error){closeConfirmation();setNotice(error?.safe?error.message:tr('requestFailed'),'bad');if(error?.status===409)await loadUsers({quiet:true})}finally{button.textContent=tr('confirm');button.disabled=false}}
+    async function performAction(){if(!pendingAction)return;const {action,user}=pendingAction;const button=byId('submitConfirm');button.disabled=true;button.textContent=tr('working');const requestBody={action,user_id:user.id,expected_revision:safeNumber(user.revision)};if(action==='delete')requestBody.confirmation_email=safeString(byId('confirmInput').value,254);try{const response=await fetch(API_ENDPOINT,{method:'POST',credentials:'same-origin',headers:mutationHeaders(),body:JSON.stringify(requestBody)});const payload=await response.json().catch(()=>({}));if(!response.ok)throw Object.assign(new Error(safeError(payload,response.status)),{safe:true,status:response.status});closeConfirmation();const manualReset=action==='send_password_reset'&&showResetLink(payload.reset_url);const deliveryUnavailable=payload.delivery_configured===false||payload.email_sent===false||payload.delivery_status==='unavailable';setNotice(manualReset?tr('resetManualReady'):deliveryUnavailable?tr('smtpMissing'):tr(`${action}Done`),manualReset?'good':deliveryUnavailable?'bad':'good');await refreshAfterAction()}catch(error){closeConfirmation();setNotice(error?.safe?error.message:tr('requestFailed'),'bad');if(error?.status===409)await refreshAfterAction()}finally{button.textContent=tr('confirm');button.disabled=false}}
     byId('localeSelect').addEventListener('change',event=>applyLocale(event.target.value,true));
     byId('refreshButton').addEventListener('click',()=>loadUsers());
     byId('searchInput').addEventListener('input',renderUsers);
@@ -414,7 +517,9 @@ _HTML = r"""<!doctype html>
     byId('confirmForm').addEventListener('submit',event=>{event.preventDefault();performAction()});
     byId('confirmDialog').addEventListener('cancel',event=>{event.preventDefault();closeConfirmation()});
     byId('resetLinkDialog').addEventListener('cancel',event=>{event.preventDefault();closeResetLink()});
-    locale=storedLocale();applyLocale(locale);loadUsers();autoRefreshId=window.setInterval(()=>{if(document.visibilityState==='visible'&&!pendingAction&&!byId('resetLinkDialog').open)loadUsers({quiet:true})},20000);window.addEventListener('pagehide',()=>{byId('resetLinkValue').value='';window.clearInterval(autoRefreshId)},{once:true});
+    function refreshVisibleUsers(){if(document.visibilityState==='visible'&&!pendingAction&&!byId('resetLinkDialog').open)loadUsers({quiet:true})}
+    document.addEventListener('visibilitychange',refreshVisibleUsers);
+    locale=storedLocale();applyLocale(locale);loadUsers();autoRefreshId=window.setInterval(refreshVisibleUsers,2000);window.addEventListener('pagehide',()=>{byId('resetLinkValue').value='';window.clearInterval(autoRefreshId)},{once:true});
   </script>
 </body>
 </html>

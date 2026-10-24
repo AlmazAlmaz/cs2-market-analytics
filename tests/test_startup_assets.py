@@ -48,6 +48,18 @@ def test_start_all_activates_only_pending_quality_gated_models_before_services()
     )
 
 
+def test_start_all_treats_vega_as_optional_until_activation_then_strict():
+    for name in ("start_all.sh", "start_all.ps1"):
+        script = (PROJECT_DIR / name).read_text(encoding="utf-8")
+
+        assert 'read_active_pointer(\n    "vega"' in script
+        assert "if vega_pointer is not None:" in script
+        assert '"Vega model": vega_dir / "vega_price_model.pt"' in script
+        assert "verify_files=True" in script
+        assert "vega_model_runtime.load_bundle_from_directory(vega_dir)" in script
+        assert "vega_model_runtime.smoke_bundle(vega_bundle)" in script
+
+
 def test_start_all_holds_one_process_wide_singleton_before_activation():
     script = (PROJECT_DIR / "start_all.sh").read_text(encoding="utf-8")
 

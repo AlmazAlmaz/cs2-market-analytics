@@ -56,6 +56,10 @@ class TrendModelConfig:
     max_item_weight: float = 0.90
     max_abs_daily_log_return: float = 0.12
     minimum_daily_volatility: float = 0.005
+    # Momentum measured over a few weeks decays; extrapolating it linearly to
+    # 30 days turned a short spike into +2000% forecasts.  The expected log
+    # return uses a damped horizon tau * (1 - exp(-h / tau)) instead of h.
+    trend_damping_days: float = 7.0
 
     def __post_init__(self) -> None:
         horizons = tuple(int(value) for value in self.horizons_days)
@@ -85,6 +89,15 @@ class TrendModelConfig:
             or self.minimum_daily_volatility <= 0
         ):
             raise ValueError("minimum_daily_volatility must be positive")
+        if (
+            not math.isfinite(self.trend_damping_days)
+            or self.trend_damping_days <= 0
+        ):
+            raise ValueError("trend_damping_days must be positive")
+
+    def damped_horizon(self, horizon_days: int) -> float:
+        tau = float(self.trend_damping_days)
+        return tau * (1.0 - math.exp(-float(horizon_days) / tau))
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -282,7 +295,7 @@ class PooledTrendForecaster:
             confidence = _clip(item_weight * freshness * volatility_penalty, 0.0, 1.0)
 
             for horizon in self.config.horizons_days:
-                expected_log_return = slope * horizon
+                expected_log_return = slope * self.config.damped_horizon(horizon)
                 uncertainty = volatility * math.sqrt(horizon)
                 point = state.current_price * math.exp(expected_log_return)
                 low = state.current_price * math.exp(

@@ -1,6 +1,7 @@
 import hashlib
 import inspect
 import json
+import os
 import pickle
 from pathlib import Path
 from types import SimpleNamespace
@@ -172,6 +173,30 @@ def _model_loader(*, overrides=None):
         return FakeCatBoostModel(**values)
 
     return load
+
+
+@pytest.mark.skipif(not hasattr(os, "O_BINARY"), reason="Windows CRT regression")
+def test_copy_verified_preserves_binary_bytes_on_windows(tmp_path, monkeypatch):
+    source = tmp_path / "candidate.cbm"
+    destination = tmp_path / "copied.cbm"
+    payload = b"catboost\r\n\x1a\x00\xff\r\nartifact"
+    source.write_bytes(payload)
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    real_open = os.open
+    observed_flags = []
+
+    def recording_open(path, flags, mode=0o777):
+        observed_flags.append(flags)
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(promotion.os, "open", recording_open)
+
+    promotion._copy_verified(source, destination, expected_sha256)
+
+    assert destination.read_bytes() == payload
+    assert hashlib.sha256(destination.read_bytes()).hexdigest() == expected_sha256
+    assert observed_flags
+    assert observed_flags[0] & os.O_BINARY
 
 
 def test_check_is_read_only_and_returns_sha256_manifest(tmp_path):
@@ -362,8 +387,11 @@ def test_check_rejects_candidate_without_strict_shared_holdout_improvement(tmp_p
         json.dumps(metrics), encoding="utf-8"
     )
 
-    with pytest.raises(promotion.PromotionError, match="not strictly better"):
+    with pytest.raises(
+        promotion.PromotionError, match="not strictly better"
+    ) as caught:
         promotion.validate_candidate(candidate, model_loader=_model_loader())
+    assert caught.value.classification == "quality"
 
 
 def test_check_binds_comparison_to_current_production(tmp_path, monkeypatch):

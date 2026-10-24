@@ -19,18 +19,20 @@ from pathlib import Path
 from typing import Any
 
 import app_config
+import portable_os
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - the production host is macOS/Linux
-    fcntl = None
+except ImportError:  # Windows
+    import portable_fcntl as fcntl
 
 
 CONTROL_SCHEMA_VERSION = 1
 STATUS_SCHEMA_VERSION = 1
 TARGET_CONTROL_SCHEMA_VERSION = 1
 DEFAULT_INTERVAL_SECONDS = 600
-MIN_INTERVAL_SECONDS = 60
+MIN_INTERVAL_SECONDS = 0
+MIN_NONZERO_INTERVAL_SECONDS = 60
 MAX_INTERVAL_SECONDS = 86400
 
 CONTROL_PATH = app_config.path(
@@ -59,6 +61,32 @@ TARGET_PROFILE_PREFIXES = {
     "gloves": "glove:",
 }
 TARGET_SELECTION_MODES = frozenset({"recommended", "custom"})
+TARGETS_PER_CYCLE_LIMITS = {
+    "sticker_guns": (1, 250),
+    "liquid_under_10": (1, 25),
+    "knives": (1, 10),
+    "gloves": (1, 10),
+}
+LISTINGS_PER_TARGET_LIMITS = {
+    "sticker_guns": (1, 50),
+    "liquid_under_10": (1, 25),
+    "knives": (1, 20),
+    "gloves": (1, 20),
+}
+DEFAULT_TARGETS_PER_CYCLE = {
+    "sticker_guns": 5,
+    "liquid_under_10": 2,
+    "knives": 1,
+    "gloves": 1,
+}
+DEFAULT_LISTINGS_PER_TARGET = {
+    "sticker_guns": 50,
+    "liquid_under_10": 20,
+    "knives": 10,
+    "gloves": 10,
+}
+MAX_INCLUDED_GROUPS = 50
+MAX_TARGET_GROUP_LENGTH = 160
 MAX_INCLUDED_TARGETS = 250
 MAX_EXCLUDED_TARGETS = 1000
 MAX_TARGET_KEY_LENGTH = 512
@@ -66,8 +94,16 @@ TARGET_CONTROL_BODY_LIMIT = 768 * 1024
 TARGET_CONTROL_FILE_KEYS = frozenset(
     {"schema_version", "revision", "profiles", "updated_at"}
 )
-TARGET_PROFILE_FILE_KEYS = frozenset(
+LEGACY_TARGET_PROFILE_FILE_KEYS = frozenset(
     {"enabled", "selection_mode", "include", "exclude"}
+)
+TARGET_PROFILE_FILE_KEYS = frozenset(
+    {
+        *LEGACY_TARGET_PROFILE_FILE_KEYS,
+        "targets_per_cycle",
+        "listings_per_target",
+        "include_groups",
+    }
 )
 
 PROCESS_STATES = frozenset({"starting", "scanning", "sleeping", "paused", "stopped"})
@@ -133,10 +169,10 @@ def _coerce_interval(value: Any, *, field_name: str = "interval_seconds") -> int
         result = int(value)
     except (TypeError, ValueError) as exc:
         raise TypeError(f"{field_name} must be an integer") from exc
-    if not MIN_INTERVAL_SECONDS <= result <= MAX_INTERVAL_SECONDS:
+    if result != 0 and not MIN_NONZERO_INTERVAL_SECONDS <= result <= MAX_INTERVAL_SECONDS:
         raise ValueError(
-            f"{field_name} must be between "
-            f"{MIN_INTERVAL_SECONDS} and {MAX_INTERVAL_SECONDS}"
+            f"{field_name} must be 0 or between "
+            f"{MIN_NONZERO_INTERVAL_SECONDS} and {MAX_INTERVAL_SECONDS}"
         )
     return result
 
@@ -222,10 +258,105 @@ def _profile_enabled_defaults(
     return defaults
 
 
+def _profile_budget_defaults(
+    budget_defaults: dict[str, Any] | None = None,
+) -> dict[str, int]:
+    defaults = dict(DEFAULT_TARGETS_PER_CYCLE)
+    for name, value in (budget_defaults or {}).items():
+        if name not in TARGET_PROFILE_NAMES:
+            raise ValueError(f"unknown scanner target profile: {name}")
+        defaults[name] = _coerce_targets_per_cycle(name, value)
+    return defaults
+
+
+def _profile_listing_defaults(
+    listing_defaults: dict[str, Any] | None = None,
+) -> dict[str, int]:
+    defaults = dict(DEFAULT_LISTINGS_PER_TARGET)
+    for name, value in (listing_defaults or {}).items():
+        if name not in TARGET_PROFILE_NAMES:
+            raise ValueError(f"unknown scanner target profile: {name}")
+        defaults[name] = _coerce_listings_per_target(name, value)
+    return defaults
+
+
+def _coerce_targets_per_cycle(profile: str, value: Any) -> int:
+    if profile not in TARGETS_PER_CYCLE_LIMITS:
+        raise ValueError(f"unknown scanner target profile: {profile}")
+    if isinstance(value, bool):
+        raise TypeError(f"{profile}.targets_per_cycle must be an integer")
+    if isinstance(value, float) and not value.is_integer():
+        raise TypeError(f"{profile}.targets_per_cycle must be an integer")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{profile}.targets_per_cycle must be an integer") from exc
+    minimum, maximum = TARGETS_PER_CYCLE_LIMITS[profile]
+    if not minimum <= result <= maximum:
+        raise ValueError(
+            f"{profile}.targets_per_cycle must be between {minimum} and {maximum}"
+        )
+    return result
+
+
+def _coerce_listings_per_target(profile: str, value: Any) -> int:
+    if profile not in LISTINGS_PER_TARGET_LIMITS:
+        raise ValueError(f"unknown scanner target profile: {profile}")
+    if isinstance(value, bool):
+        raise TypeError(f"{profile}.listings_per_target must be an integer")
+    if isinstance(value, float) and not value.is_integer():
+        raise TypeError(f"{profile}.listings_per_target must be an integer")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{profile}.listings_per_target must be an integer") from exc
+    minimum, maximum = LISTINGS_PER_TARGET_LIMITS[profile]
+    if not minimum <= result <= maximum:
+        raise ValueError(
+            f"{profile}.listings_per_target must be between {minimum} and {maximum}"
+        )
+    return result
+
+
+def _validate_target_groups(value: Any, profile: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ScannerControlError(f"{profile}.include_groups must be a JSON list")
+    if len(value) > MAX_INCLUDED_GROUPS:
+        raise ScannerControlError(
+            f"{profile}.include_groups may contain at most {MAX_INCLUDED_GROUPS} groups"
+        )
+    normalized: list[str] = []
+    for raw in value:
+        if not isinstance(raw, str):
+            raise ScannerControlError(
+                f"{profile}.include_groups values must be strings"
+            )
+        group = raw.strip()
+        if (
+            not group
+            or len(group) > MAX_TARGET_GROUP_LENGTH
+            or any(character in group for character in ("\x00", "\r", "\n"))
+        ):
+            raise ScannerControlError(
+                f"{profile}.include_groups contains an invalid group"
+            )
+        normalized.append(group)
+    normalized = list(dict.fromkeys(normalized))
+    if profile != "sticker_guns" and normalized:
+        raise ScannerControlError(
+            f"{profile}.include_groups is only supported for sticker_guns"
+        )
+    return normalized
+
+
 def _default_target_control(
     profile_defaults: dict[str, Any] | None = None,
+    budget_defaults: dict[str, Any] | None = None,
+    listing_defaults: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     enabled = _profile_enabled_defaults(profile_defaults)
+    budgets = _profile_budget_defaults(budget_defaults)
+    listings = _profile_listing_defaults(listing_defaults)
     return {
         "schema_version": TARGET_CONTROL_SCHEMA_VERSION,
         "revision": 0,
@@ -235,6 +366,9 @@ def _default_target_control(
                 "selection_mode": "recommended",
                 "include": [],
                 "exclude": [],
+                "targets_per_cycle": budgets[name],
+                "listings_per_target": listings[name],
+                "include_groups": [],
             }
             for name in TARGET_PROFILE_NAMES
         },
@@ -273,7 +407,12 @@ def _validate_target_keys(value: Any, profile: str, field_name: str) -> list[str
     return list(dict.fromkeys(normalized))
 
 
-def _validate_target_control_file(payload: Any) -> dict[str, Any]:
+def _validate_target_control_file(
+    payload: Any,
+    *,
+    budget_defaults: dict[str, Any] | None = None,
+    listing_defaults: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ScannerControlError("scanner target control must contain a JSON object")
     if set(payload) != TARGET_CONTROL_FILE_KEYS:
@@ -290,9 +429,15 @@ def _validate_target_control_file(payload: Any) -> dict[str, Any]:
         raise ScannerControlError("scanner target control profiles are incomplete")
 
     normalized_profiles: dict[str, dict[str, Any]] = {}
+    budgets = _profile_budget_defaults(budget_defaults)
+    listings = _profile_listing_defaults(listing_defaults)
     for name in TARGET_PROFILE_NAMES:
         profile = profiles[name]
-        if not isinstance(profile, dict) or set(profile) != TARGET_PROFILE_FILE_KEYS:
+        profile_keys = set(profile) if isinstance(profile, dict) else set()
+        if (
+            not LEGACY_TARGET_PROFILE_FILE_KEYS.issubset(profile_keys)
+            or not profile_keys.issubset(TARGET_PROFILE_FILE_KEYS)
+        ):
             raise ScannerControlError(f"scanner target profile {name} is invalid")
         if not isinstance(profile.get("enabled"), bool):
             raise ScannerControlError(f"{name}.enabled must be true or false")
@@ -308,11 +453,29 @@ def _validate_target_control_file(payload: Any) -> dict[str, Any]:
             raise ScannerControlError(
                 f"{name}.include and {name}.exclude must not overlap"
             )
+        try:
+            targets_per_cycle = _coerce_targets_per_cycle(
+                name,
+                profile.get("targets_per_cycle", budgets[name]),
+            )
+            listings_per_target = _coerce_listings_per_target(
+                name,
+                profile.get("listings_per_target", listings[name]),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ScannerControlError(str(exc)) from exc
+        include_groups = _validate_target_groups(
+            profile.get("include_groups", []),
+            name,
+        )
         normalized_profiles[name] = {
             "enabled": profile["enabled"],
             "selection_mode": selection_mode,
             "include": include,
             "exclude": exclude,
+            "targets_per_cycle": targets_per_cycle,
+            "listings_per_target": listings_per_target,
+            "include_groups": include_groups,
         }
 
     return {
@@ -407,17 +570,7 @@ def _ensure_private_mode(path: Path) -> None:
 
 
 def _fsync_directory(directory: Path) -> None:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    try:
-        directory_fd = os.open(directory, flags)
-    except OSError:
-        return
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+    portable_os.fsync_directory(directory)
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -432,7 +585,7 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             dir=path.parent,
         )
         temp_path = Path(temp_name)
-        os.fchmod(fd, 0o600)
+        portable_os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
             handle.write("\n")
@@ -469,7 +622,7 @@ def _state_lock(path: Path):
             raise ScannerControlError(f"cannot lock scanner state at {path}") from exc
         try:
             if stat.S_IMODE(os.fstat(lock_fd).st_mode) != 0o600:
-                os.fchmod(lock_fd, 0o600)
+                portable_os.fchmod(lock_fd, 0o600)
             if fcntl is not None:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
             yield
@@ -558,6 +711,8 @@ def get_scanner_target_control(
     *,
     path: str | Path | None = None,
     profile_defaults: dict[str, Any] | None = None,
+    budget_defaults: dict[str, Any] | None = None,
+    listing_defaults: dict[str, Any] | None = None,
     create_if_missing: bool = True,
 ) -> dict[str, Any]:
     """Return durable profile selection without exposing scanner secrets.
@@ -568,11 +723,19 @@ def get_scanner_target_control(
     closed and disables every profile.
     """
 
-    default_control = _default_target_control(profile_defaults)
+    default_control = _default_target_control(
+        profile_defaults,
+        budget_defaults,
+        listing_defaults,
+    )
     target_path = _resolve_path(path, TARGET_CONTROL_PATH)
     with _state_lock(target_path):
         try:
-            payload = _validate_target_control_file(_read_json(target_path))
+            payload = _validate_target_control_file(
+                _read_json(target_path),
+                budget_defaults=budget_defaults,
+                listing_defaults=listing_defaults,
+            )
             _ensure_private_mode(target_path)
         except FileNotFoundError:
             payload = default_control
@@ -580,7 +743,9 @@ def get_scanner_target_control(
                 _atomic_write_json(target_path, payload)
         except ScannerControlError:
             failed_closed = _default_target_control(
-                {name: False for name in TARGET_PROFILE_NAMES}
+                {name: False for name in TARGET_PROFILE_NAMES},
+                budget_defaults,
+                listing_defaults,
             )
             failed_closed["updated_at"] = None
             failed_closed["error"] = "invalid_target_control_state"
@@ -588,10 +753,19 @@ def get_scanner_target_control(
     return payload
 
 
-def validate_scanner_target_control(payload: Any) -> dict[str, Any]:
+def validate_scanner_target_control(
+    payload: Any,
+    *,
+    budget_defaults: dict[str, Any] | None = None,
+    listing_defaults: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Validate and normalize an in-memory target-control document."""
 
-    return _validate_target_control_file(payload)
+    return _validate_target_control_file(
+        payload,
+        budget_defaults=budget_defaults,
+        listing_defaults=listing_defaults,
+    )
 
 
 def update_scanner_target_control(
@@ -600,6 +774,8 @@ def update_scanner_target_control(
     expected_revision: int | None = None,
     path: str | Path | None = None,
     profile_defaults: dict[str, Any] | None = None,
+    budget_defaults: dict[str, Any] | None = None,
+    listing_defaults: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply a validated partial profile patch with optimistic concurrency.
 
@@ -624,9 +800,17 @@ def update_scanner_target_control(
     target_path = _resolve_path(path, TARGET_CONTROL_PATH)
     with _state_lock(target_path):
         try:
-            payload = _validate_target_control_file(_read_json(target_path))
+            payload = _validate_target_control_file(
+                _read_json(target_path),
+                budget_defaults=budget_defaults,
+                listing_defaults=listing_defaults,
+            )
         except FileNotFoundError:
-            payload = _default_target_control(profile_defaults)
+            payload = _default_target_control(
+                profile_defaults,
+                budget_defaults,
+                listing_defaults,
+            )
         except ScannerControlError as exc:
             raise ScannerControlError(
                 "scanner target control is invalid; preserve or remove it before updating"
@@ -650,7 +834,11 @@ def update_scanner_target_control(
 
         payload["revision"] += 1
         payload["updated_at"] = _utc_now()
-        payload = _validate_target_control_file(payload)
+        payload = _validate_target_control_file(
+            payload,
+            budget_defaults=budget_defaults,
+            listing_defaults=listing_defaults,
+        )
         _atomic_write_json(target_path, payload)
     return payload
 

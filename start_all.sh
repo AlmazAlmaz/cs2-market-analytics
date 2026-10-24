@@ -171,6 +171,7 @@ import os
 import stat
 
 import app_config
+import model_generations
 
 required = {
     "database": app_config.path("CS2_DB_PATH", "csfloat_history.db"),
@@ -183,9 +184,29 @@ required = {
     "Nova model": app_config.PROJECT_DIR / "NEURALMODEL" / "artifacts" / "nova_price_model.pt",
     "Nova metadata": app_config.PROJECT_DIR / "NEURALMODEL" / "artifacts" / "nova_metadata.json",
 }
+vega_dir = None
+vega_pointer = model_generations.read_active_pointer(
+    "vega", project_dir=app_config.PROJECT_DIR
+)
+if vega_pointer is not None:
+    vega_dir = model_generations.active_or_legacy_bundle_dir(
+        "vega",
+        app_config.PROJECT_DIR / "VEGAMODEL" / "artifacts",
+        project_dir=app_config.PROJECT_DIR,
+        verify_files=True,
+    )
+    required.update({
+        "Vega model": vega_dir / "vega_price_model.pt",
+        "Vega metadata": vega_dir / "vega_metadata.json",
+        "Vega metrics": vega_dir / "vega_metrics.json",
+    })
 missing = [f"{label}: {path}" for label, path in required.items() if not path.is_file()]
 if missing:
     raise SystemExit("Missing required project files:\n- " + "\n- ".join(missing))
+if vega_dir is not None:
+    import vega_model_runtime
+    vega_bundle = vega_model_runtime.load_bundle_from_directory(vega_dir)
+    vega_model_runtime.smoke_bundle(vega_bundle)
 
 if app_config.CONFIG_PATH.exists():
     mode = stat.S_IMODE(app_config.CONFIG_PATH.stat().st_mode)

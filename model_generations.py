@@ -25,11 +25,12 @@ from pathlib import Path
 from typing import Any
 
 import app_config
+import portable_os
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - production is macOS/Linux.
-    fcntl = None
+except ImportError:  # Windows
+    import portable_fcntl as fcntl
 
 
 SCHEMA_VERSION = 1
@@ -57,6 +58,11 @@ MODEL_FILES: dict[str, tuple[str, ...]] = {
         "nova_metadata.json",
         "nova_metrics.json",
     ),
+    "vega": (
+        "vega_price_model.pt",
+        "vega_metadata.json",
+        "vega_metrics.json",
+    ),
     "knives": (
         "knife_price_model.joblib",
         "knife_price_model_metrics.json",
@@ -71,6 +77,7 @@ LEGACY_DIRECTORIES = {
     "almaz": Path("models"),
     "igor": Path("IGORMODEL/artifacts"),
     "nova": Path("NEURALMODEL/artifacts"),
+    "vega": Path("VEGAMODEL/artifacts"),
     "knives": Path("KNIFEMODEL/artifacts"),
     "gloves": Path("GLOVEMODEL/artifacts"),
 }
@@ -79,6 +86,7 @@ STAGING_ROOTS = {
     "almaz": Path("models/staging/training_jobs"),
     "igor": Path("IGORMODEL/staging/training_jobs"),
     "nova": Path("NEURALMODEL/staging/training_jobs"),
+    "vega": Path("VEGAMODEL/staging/training_jobs"),
     "knives": Path("KNIFEMODEL/staging/training_jobs"),
     "gloves": Path("GLOVEMODEL/staging/training_jobs"),
 }
@@ -87,6 +95,7 @@ MODEL_ITEM_KINDS = {
     "almaz": "weapon_skin",
     "igor": "weapon_skin",
     "nova": "weapon_skin",
+    "vega": "weapon_skin",
     "knives": "knife",
     "gloves": "glove",
 }
@@ -167,11 +176,7 @@ def _require_model(model: str) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    portable_os.fsync_directory(path)
 
 
 def _secure_directory(path: Path, project: Path) -> None:
@@ -227,8 +232,8 @@ def _require_private_directory(path: Path, project: Path) -> None:
             raise GenerationError(f"managed generation directory is missing: {cursor}") from exc
         if (
             not stat.S_ISDIR(info.st_mode)
-            or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) & 0o022
+            or not portable_os.owned_by_current_user(info)
+            or portable_os.has_unsafe_group_or_world_write(info)
         ):
             raise GenerationError(f"managed generation directory is unsafe: {cursor}")
 
@@ -245,8 +250,8 @@ def _read_json(path: Path, *, optional: bool = False) -> dict[str, Any] | None:
         info = os.fstat(descriptor)
         if (
             not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) & 0o022
+            or not portable_os.owned_by_current_user(info)
+            or portable_os.has_unsafe_group_or_world_write(info)
             or info.st_size > MAX_JSON_BYTES
         ):
             raise GenerationError(f"generation document is unsafe: {path.name}")
@@ -293,7 +298,14 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _sha256_file(path: Path) -> str:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # Explicit binary mode is required for descriptors opened through the
+    # Windows CRT; otherwise arbitrary PyTorch bytes can be translated before
+    # hashing and produce a false SHA-256 mismatch.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
     descriptor: int | None = None
     digest = hashlib.sha256()
     try:
@@ -357,7 +369,7 @@ class _GenerationLock:
             info = os.fstat(self.descriptor)
             if not stat.S_ISREG(info.st_mode):
                 raise GenerationError("generation activation lock is not a regular file")
-            os.fchmod(self.descriptor, 0o600)
+            portable_os.fchmod(self.descriptor, 0o600)
             fcntl.flock(self.descriptor, fcntl.LOCK_EX)
             return self
         except BaseException:
@@ -543,12 +555,12 @@ def _remove_managed_tree(path: Path, root: Path) -> None:
     for directory, names, filenames in os.walk(path, topdown=True, followlinks=False):
         directory_path = Path(directory)
         info = directory_path.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        if not stat.S_ISDIR(info.st_mode) or not portable_os.owned_by_current_user(info):
             raise GenerationError(f"unsafe directory in generation cleanup: {directory_path}")
         for name in [*names, *filenames]:
             child = directory_path / name
             child_info = child.lstat()
-            if stat.S_ISLNK(child_info.st_mode) or child_info.st_uid != os.getuid():
+            if stat.S_ISLNK(child_info.st_mode) or not portable_os.owned_by_current_user(child_info):
                 raise GenerationError(f"unsafe entry in generation cleanup: {child}")
     for directory, _names, filenames in os.walk(path, topdown=False):
         directory_path = Path(directory)
@@ -718,14 +730,18 @@ def _copy_candidate_generation(
             if not isinstance(expected, dict):
                 raise GenerationError(f"quality-gate file identity is missing: {filename}")
             destination_file = temporary / filename
-            source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            binary = getattr(os, "O_BINARY", 0)
+            source_fd = os.open(
+                source,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | binary,
+            )
             try:
                 source_info = os.fstat(source_fd)
                 if not stat.S_ISREG(source_info.st_mode):
                     raise GenerationError(f"candidate artifact is unsafe: {filename}")
                 destination_fd = os.open(
                     destination_file,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | binary,
                     0o400,
                 )
                 digest = hashlib.sha256()
@@ -793,6 +809,10 @@ def _default_validate(model: str, candidate: Path) -> dict[str, Any]:
         from IGORMODEL.promote_candidate import validate_candidate
 
         return validate_candidate(candidate)
+    if model == "vega":
+        from VEGAMODEL.promote_candidate import validate_candidate
+
+        return validate_candidate(candidate)
     from model_candidate_promotion import validate_candidate
 
     return validate_candidate(model, candidate)
@@ -807,6 +827,8 @@ def _default_load_and_smoke(model: str, directory: Path) -> Any:
         import knife_model_runtime as runtime
     elif model == "gloves":
         import glove_model_runtime as runtime
+    elif model == "vega":
+        import vega_model_runtime as runtime
     else:
         import neural_model_runtime as runtime
     bundle = runtime.load_bundle_from_directory(directory)

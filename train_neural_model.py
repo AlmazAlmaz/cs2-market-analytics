@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 import app_config
 import model_generations
+import portable_os
 from IGORMODEL import build_cache
 from IGORMODEL import train as igor_train
 from item_classification import ITEM_KIND_WEAPON_SKIN, STRICT_ITEM_KIND_POLICY
@@ -49,7 +50,7 @@ POST_SPLIT_DERIVED_FEATURES = frozenset(
 )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact-dir", type=Path, default=DEFAULT_ARTIFACT_DIR)
     parser.add_argument("--cache-path", type=Path, default=DEFAULT_CACHE_PATH)
@@ -74,17 +75,49 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Reserve at least this many newest rows (timestamp ties stay together)",
     )
-    parser.add_argument("--device", choices=("auto", "cpu", "mps"), default="auto")
-    return parser.parse_args()
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda", "mps"),
+        default=app_config.get("CS2_TRAINING_DEVICE", "auto").lower() or "auto",
+        help="Training accelerator: auto prefers CUDA, then Apple MPS, then CPU",
+    )
+    parser.add_argument(
+        "--require-gpu",
+        action="store_true",
+        default=app_config.get_bool("CS2_TRAINING_REQUIRE_GPU", False),
+        help="Fail instead of silently using CPU when no GPU backend is available",
+    )
+    return parser.parse_args(argv)
 
 
-def choose_device(requested: str) -> torch.device:
+def choose_device(requested: str, *, require_gpu: bool = False) -> torch.device:
+    requested = str(requested).strip().lower()
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested but this PyTorch build cannot use the NVIDIA GPU. "
+                "Run setup_windows.ps1 to install the CUDA wheel."
+            )
+        return torch.device("cuda")
     if requested == "mps":
-        if not torch.backends.mps.is_available():
+        mps = getattr(torch.backends, "mps", None)
+        if mps is None or not mps.is_available():
             raise RuntimeError("MPS was requested but is not available")
         return torch.device("mps")
-    if requested == "auto" and torch.backends.mps.is_available():
-        return torch.device("mps")
+    if requested not in {"auto", "cpu"}:
+        raise ValueError(f"unsupported training device: {requested!r}")
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and mps.is_available():
+            return torch.device("mps")
+        if require_gpu:
+            raise RuntimeError(
+                "GPU training is required, but neither CUDA nor Apple MPS is available"
+            )
+    elif require_gpu:
+        raise RuntimeError("--require-gpu cannot be combined with --device cpu")
     return torch.device("cpu")
 
 
@@ -197,12 +230,7 @@ def resolve_staging_dir(path: Path) -> Path:
 
 
 def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    descriptor = os.open(path, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    portable_os.fsync_directory(path)
 
 
 def atomic_json_dump(payload: dict, path: Path, *, compact: bool = False) -> None:
@@ -238,7 +266,8 @@ def atomic_torch_save(payload: dict[str, torch.Tensor], path: Path) -> None:
     temporary = Path(temporary_name)
     try:
         torch.save(payload, temporary)
-        with temporary.open("rb") as handle:
+        # FlushFileBuffers requires a writable handle on Windows.
+        with temporary.open("r+b") as handle:
             os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
@@ -316,14 +345,20 @@ def transform_frame(
     return categories, numeric, target, weight, np.stack((log_reference, price), axis=1)
 
 
-def make_loader(arrays: tuple[np.ndarray, ...], batch_size: int, *, shuffle: bool) -> DataLoader:
+def make_loader(
+    arrays: tuple[np.ndarray, ...],
+    batch_size: int,
+    *,
+    shuffle: bool,
+    pin_memory: bool = False,
+) -> DataLoader:
     tensors = tuple(torch.from_numpy(array) for array in arrays)
     return DataLoader(
         TensorDataset(*tensors),
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=0,
-        pin_memory=False,
+        pin_memory=pin_memory,
         drop_last=shuffle,
     )
 
@@ -351,7 +386,11 @@ def collect_predictions(model: NovaPriceNet, loader: DataLoader, device: torch.d
     references: list[np.ndarray] = []
     prices: list[np.ndarray] = []
     for categories, numeric, target, _weight, auxiliary in loader:
-        output = model(categories.to(device), numeric.to(device)).cpu().numpy()
+        non_blocking = device.type == "cuda"
+        output = model(
+            categories.to(device, non_blocking=non_blocking),
+            numeric.to(device, non_blocking=non_blocking),
+        ).cpu().numpy()
         predictions.append(output)
         targets.append(target.numpy())
         references.append(auxiliary[:, 0].numpy())
@@ -487,7 +526,12 @@ def evaluate_production_model(
         cat_features=cat_features,
         numeric_features=numeric_features,
     )
-    loader = make_loader(arrays, batch_size * 2, shuffle=False)
+    loader = make_loader(
+        arrays,
+        batch_size * 2,
+        shuffle=False,
+        pin_memory=device.type == "cuda",
+    )
     old_model = NovaPriceNet(**metadata["model_config"]).to(device)
     old_state = torch.load(model_path, map_location="cpu", weights_only=True)
     old_model.load_state_dict(old_state)
@@ -538,8 +582,8 @@ def calibrate_quantiles(
     return scale, calibration
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv=None) -> None:
+    args = parse_args(argv)
     if args.test_rows is not None and args.test_rows < 1_000:
         raise ValueError("--test-rows must be at least 1000")
     artifact_dir = resolve_staging_dir(args.artifact_dir)
@@ -580,8 +624,18 @@ def main() -> None:
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
     torch.manual_seed(RANDOM_SEED)
-    device = choose_device(args.device)
-    print(f"device: {device}", flush=True)
+    device = choose_device(args.device, require_gpu=args.require_gpu)
+    device_name = (
+        torch.cuda.get_device_name(device) if device.type == "cuda" else str(device)
+    )
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(RANDOM_SEED)
+        torch.set_float32_matmul_precision("high")
+    print(
+        f"device: {device} ({device_name})"
+        + (f", torch CUDA {torch.version.cuda}" if device.type == "cuda" else ""),
+        flush=True,
+    )
     print(f"loading chronological cache: {cache_path}", flush=True)
     (
         train,
@@ -618,9 +672,22 @@ def main() -> None:
     del train, validation, test
     gc.collect()
 
-    train_loader = make_loader(train_arrays, args.batch_size, shuffle=True)
-    validation_loader = make_loader(validation_arrays, args.batch_size * 2, shuffle=False)
-    test_loader = make_loader(test_arrays, args.batch_size * 2, shuffle=False)
+    pin_memory = device.type == "cuda"
+    train_loader = make_loader(
+        train_arrays, args.batch_size, shuffle=True, pin_memory=pin_memory
+    )
+    validation_loader = make_loader(
+        validation_arrays,
+        args.batch_size * 2,
+        shuffle=False,
+        pin_memory=pin_memory,
+    )
+    test_loader = make_loader(
+        test_arrays,
+        args.batch_size * 2,
+        shuffle=False,
+        pin_memory=pin_memory,
+    )
     cardinalities = [len(vocabularies[column]) + 2 for column in CAT_FEATURES]
     embedding_dims = [embedding_dim(value) for value in cardinalities]
     model_config = {
@@ -648,10 +715,11 @@ def main() -> None:
         total_loss = 0.0
         total_rows = 0
         for categories, numeric, target, weight, _auxiliary in train_loader:
-            categories = categories.to(device)
-            numeric = numeric.to(device)
-            target = target.to(device)
-            weight = weight.to(device)
+            non_blocking = device.type == "cuda"
+            categories = categories.to(device, non_blocking=non_blocking)
+            numeric = numeric.to(device, non_blocking=non_blocking)
+            target = target.to(device, non_blocking=non_blocking)
+            weight = weight.to(device, non_blocking=non_blocking)
             optimizer.zero_grad(set_to_none=True)
             outputs = model(categories, numeric)
             loss = training_loss(outputs, target, weight)
@@ -801,6 +869,8 @@ def main() -> None:
         "architecture": "categorical_embeddings_residual_mlp_ordered_quantiles",
         "parameters": parameter_count,
         "device": str(device),
+        "device_name": device_name,
+        "torch_cuda_version": torch.version.cuda,
         "train_rows": len(train_arrays[2]),
         "validation_rows": len(validation_arrays[2]),
         "test_rows": len(test_arrays[2]),

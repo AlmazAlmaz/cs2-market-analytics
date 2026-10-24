@@ -256,7 +256,8 @@ def test_dashboard_source_and_rendered_pages_have_no_mojibake_or_legacy_mixed_co
 def test_model_comparison_is_the_canonical_localized_nova_ui():
     template = dashboard_server.DEAL_HTML
     assert "/api/predict-deal?" in template
-    assert "['almaz', 'igor', 'nova']" in template
+    assert "['almaz', 'igor', 'nova', 'vega']" in template
+    assert "Vega (advisory)" in template
     assert 'id="modelComparisonGrid"' in template
 
     rendered = dashboard_server.render_private_html(template, "ru")

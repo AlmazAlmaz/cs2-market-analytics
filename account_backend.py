@@ -38,10 +38,14 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SCHEMA_COMPONENT = "account_backend"
 ROLES = frozenset({"admin", "member"})
 ACCESS_STATES = frozenset({"pending", "approved", "blocked", "deleted"})
+DATABASE_DOWNLOAD_STATUSES = frozenset(
+    {"preparing", "downloading", "completed", "interrupted", "failed"}
+)
+ACTIVE_DATABASE_DOWNLOAD_STATUSES = frozenset({"preparing", "downloading"})
 INVENTORY_STATUSES = frozenset({"owned", "listed", "sold", "archived"})
 INVENTORY_STRATEGIES = frozenset(
     {
@@ -559,6 +563,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
         _migrate_v2(conn)
     if current < 3:
         _migrate_v3(conn)
+    if current < 4:
+        _migrate_v4(conn)
     conn.execute(
         """
         INSERT INTO app_schema_versions(component, version, migrated_at)
@@ -917,6 +923,38 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
             SELECT RAISE(ABORT, 'inventory trade legs are immutable');
         END
         """
+    )
+
+
+def _migrate_v4(conn: sqlite3.Connection) -> None:
+    """Persist the bytes sent for database downloads, including interrupted ones."""
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS account_database_downloads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER REFERENCES account_users(id) ON DELETE SET NULL,
+            status TEXT NOT NULL DEFAULT 'preparing'
+                CHECK(status IN (
+                    'preparing', 'downloading', 'completed', 'interrupted', 'failed'
+                )),
+            bytes_sent INTEGER NOT NULL DEFAULT 0 CHECK(bytes_sent >= 0),
+            total_bytes INTEGER CHECK(total_bytes IS NULL OR total_bytes >= bytes_sent),
+            filename TEXT,
+            ip_address TEXT,
+            started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finished_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_account_downloads_user_time "
+        "ON account_database_downloads(user_id, started_at DESC, id DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_account_downloads_status "
+        "ON account_database_downloads(status)"
     )
 
 
@@ -1370,7 +1408,8 @@ class AccountService:
     A new connection is opened per operation, so the object is safe to share
     between ``ThreadingHTTPServer`` request threads.  ``:memory:`` is supported
     for tests through a private shared-cache URI retained by an anchor
-    connection.
+    connection.  The HTTP server keeps one service instance per database;
+    opening it recovers downloads left active by a previous server process.
     """
 
     def __init__(
@@ -1415,6 +1454,18 @@ class AccountService:
                 conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("BEGIN IMMEDIATE")
             init_schema(conn)
+            # A server restart cannot resume the old HTTP connections.  Preserve
+            # their last persisted byte counts without leaving phantom activity.
+            timestamp = _iso()
+            conn.execute(
+                """
+                UPDATE account_database_downloads
+                SET status = 'interrupted', updated_at = MAX(updated_at, ?),
+                    finished_at = MAX(updated_at, ?)
+                WHERE status IN ('preparing', 'downloading')
+                """,
+                (timestamp, timestamp),
+            )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -1580,6 +1631,143 @@ class AccountService:
                 code="revision_conflict",
             )
 
+    def start_database_download(
+        self,
+        user_id: int | None = None,
+        *,
+        ip_address: Any = None,
+        now: datetime | None = None,
+    ) -> int:
+        """Record an authorised server download before snapshot preparation.
+
+        ``None`` identifies a legacy dashboard-token request, whose account
+        identity is unknown.  This internal method is called only after HTTP
+        authentication; its download id is never accepted from the client.
+        """
+
+        owner_id = self._normalise_user_id(user_id) if user_id is not None else None
+        timestamp = _iso(now)
+        with self._connection(write=True) as conn:
+            if owner_id is not None:
+                self._approved_user_row(conn, owner_id)
+            cursor = conn.execute(
+                """
+                INSERT INTO account_database_downloads(
+                    user_id, ip_address, started_at, updated_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (owner_id, _normalise_ip_address(ip_address), timestamp, timestamp),
+            )
+            return int(cursor.lastrowid)
+
+    def update_database_download(
+        self,
+        download_id: int,
+        *,
+        status: str,
+        bytes_sent: int = 0,
+        total_bytes: int | None = None,
+        filename: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Persist cumulative successful writes; finished downloads are immutable.
+
+        HTTP handlers report after successful writes, including their final
+        count on disconnect.  Stale progress cannot reduce the count or move a
+        downloading record back to preparing.  Bytes accepted by the server's
+        socket do not prove that a browser saved the file to disk.
+        """
+
+        record_id = _bounded_int(
+            download_id, field="download_id", minimum=1, maximum=2**63 - 1
+        )
+        normal_status = str(status or "").strip().lower()
+        if normal_status not in DATABASE_DOWNLOAD_STATUSES:
+            raise ValidationError("database download status is invalid")
+        sent = _bounded_int(
+            bytes_sent, field="bytes_sent", minimum=0, maximum=2**63 - 1
+        )
+        size = (
+            _bounded_int(total_bytes, field="total_bytes", minimum=0, maximum=2**63 - 1)
+            if total_bytes is not None
+            else None
+        )
+        safe_filename = None
+        if filename is not None:
+            # Both path styles must be stripped even on the other platform.
+            basename = str(filename).replace("\\", "/").rsplit("/", 1)[-1]
+            basename = "".join(
+                char if unicodedata.category(char)[0] != "C" else "_"
+                for char in basename
+            )
+            safe_filename = _normalise_text(basename, field="filename", maximum=255)
+            if safe_filename in {".", ".."}:
+                safe_filename = None
+        timestamp = _iso(now)
+        with self._connection(write=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM account_database_downloads WHERE id = ?", (record_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("database download not found")
+            if row["status"] not in ACTIVE_DATABASE_DOWNLOAD_STATUSES:
+                return
+            sent = max(sent, int(row["bytes_sent"]))
+            size = size if size is not None else row["total_bytes"]
+            if size is not None and sent > size:
+                raise ValidationError("bytes_sent cannot exceed total_bytes")
+            if normal_status == "completed" and (size is None or sent != size):
+                raise ValidationError("a completed download must have sent the entire file")
+            if row["status"] == "downloading" and normal_status == "preparing":
+                normal_status = "downloading"
+            timestamp = max(timestamp, row["updated_at"])
+            finished_at = (
+                None if normal_status in ACTIVE_DATABASE_DOWNLOAD_STATUSES else timestamp
+            )
+            conn.execute(
+                """
+                UPDATE account_database_downloads
+                SET status = ?, bytes_sent = ?, total_bytes = ?,
+                    filename = COALESCE(?, filename), updated_at = ?, finished_at = ?
+                WHERE id = ?
+                """,
+                (
+                    normal_status, sent, size, safe_filename, timestamp,
+                    finished_at, record_id,
+                ),
+            )
+
+    @staticmethod
+    def _database_download_summary(
+        conn: sqlite3.Connection, user_id: int | None
+    ) -> dict[str, Any]:
+        totals = conn.execute(
+            """
+            SELECT COALESCE(SUM(status IN ('preparing', 'downloading')), 0) AS active_count,
+                   COALESCE(SUM(bytes_sent), 0) AS total_bytes,
+                   COALESCE(SUM(status = 'completed'), 0) AS completed_count
+            FROM account_database_downloads WHERE user_id IS ?
+            """,
+            (user_id,),
+        ).fetchone()
+        recent = conn.execute(
+            """
+            SELECT id, status, bytes_sent, total_bytes, filename,
+                   started_at, updated_at, finished_at, ip_address
+            FROM account_database_downloads WHERE user_id IS ?
+            ORDER BY (status IN ('preparing', 'downloading')) DESC,
+                     started_at DESC, id DESC
+            LIMIT 5
+            """,
+            (user_id,),
+        ).fetchall()
+        return {
+            "active_count": int(totals["active_count"]),
+            "total_bytes": int(totals["total_bytes"]),
+            "completed_count": int(totals["completed_count"]),
+            "recent": [dict(row) for row in recent],
+        }
+
     def _admin_user_payload(
         self,
         conn: sqlite3.Connection,
@@ -1722,6 +1910,7 @@ class AccountService:
             "active_inventory_items": int(inventory["active_items"]),
             "password_changed_at": password_changed_at,
             "password_reset_sent_at": password_reset_sent_at,
+            "database_downloads": self._database_download_summary(conn, user_id),
         }
         if include_sessions:
             payload["sessions"] = session_payloads
@@ -1895,7 +2084,11 @@ class AccountService:
                 SELECT * FROM account_users
                 """
                 + where
-                + " ORDER BY CASE access_state "
+                + " ORDER BY EXISTS ("
+                "SELECT 1 FROM account_database_downloads AS active_download "
+                "WHERE active_download.user_id = account_users.id "
+                "AND active_download.status IN ('preparing', 'downloading')"
+                ") DESC, CASE access_state "
                 "WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 "
                 "WHEN 'blocked' THEN 2 ELSE 3 END, created_at DESC, id DESC "
                 "LIMIT ? OFFSET ?",
@@ -1928,6 +2121,13 @@ class AccountService:
                 if state in state_counts:
                     state_counts[state] = int(count_row["amount"])
             global_total = sum(state_counts.values())
+            downloading_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM account_database_downloads "
+                    "WHERE status IN ('preparing', 'downloading')"
+                ).fetchone()[0]
+            )
+            unattributed_downloads = self._database_download_summary(conn, None)
         return {
             "users": users,
             "total": total,
@@ -1935,10 +2135,12 @@ class AccountService:
             "limit": page_limit,
             "offset": page_offset,
             "online_count": online_count,
+            "unattributed_downloads": unattributed_downloads,
             "summary": {
                 "total": global_total,
                 **state_counts,
                 "online": online_count,
+                "downloading": downloading_count,
             },
         }
 
@@ -2201,6 +2403,10 @@ class AccountService:
                 WHERE user_id = ?
                 """,
                 (timestamp, target_id),
+            )
+            conn.execute(
+                "UPDATE account_database_downloads SET ip_address = NULL WHERE user_id = ?",
+                (target_id,),
             )
             invalidated_resets = int(
                 conn.execute(

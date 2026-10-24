@@ -1055,7 +1055,7 @@ def _atomic_write_cache(path: Path, payload: bytes) -> None:
     temporary = Path(temporary_name)
     try:
         try:
-            os.fchmod(descriptor, 0o600)
+            getattr(os, "fchmod", lambda _descriptor, _mode: None)(descriptor, 0o600)
         except OSError:
             pass
         with os.fdopen(descriptor, "wb") as handle:

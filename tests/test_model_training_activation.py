@@ -84,7 +84,8 @@ def test_schedule_uses_private_atomic_record_and_public_relative_path(
 
     path = tmp_path / ".run" / "model_training" / "pending" / "almaz.json"
     assert path.is_file()
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert not Path(record["candidate_dir"]).is_absolute()
     assert record["candidate_bundle_sha256"] == SHA
     assert json.loads(path.read_text(encoding="utf-8")) == record
@@ -248,7 +249,7 @@ def test_schedule_rechecks_cancellation_inside_activation_lock(
 
 
 def test_contended_activation_locks_do_not_leak_file_descriptors(tmp_path):
-    before = len(os.listdir("/dev/fd"))
+    before = len(os.listdir("/dev/fd")) if os.name != "nt" else None
     with activation._activation_lock(tmp_path):
         for _ in range(20):
             with (
@@ -270,4 +271,5 @@ def test_contended_activation_locks_do_not_leak_file_descriptors(tmp_path):
     finally:
         activation.fcntl.flock(descriptor, activation.fcntl.LOCK_UN)
         os.close(descriptor)
-    assert len(os.listdir("/dev/fd")) <= before + 1
+    if before is not None:
+        assert len(os.listdir("/dev/fd")) <= before + 1

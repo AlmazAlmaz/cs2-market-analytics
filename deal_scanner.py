@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows
+    import portable_fcntl as fcntl
 import json
 import math
 import os
@@ -16,6 +19,7 @@ import app_config
 import csfloat_listing_fetcher
 import deal_intelligence
 import item_classification
+import model_generations
 import model_lifecycle
 import scanner_control
 import scanner_target_profiles
@@ -102,14 +106,27 @@ DEFAULT_CONFIG = {
     "min_liquidity_score": 20.0,
     "save_verdicts": ["good", "watch"],
     "save_all_predictions": False,
-    "enabled_models": ["almaz", "igor", "nova"],
+    # Vega is accepted here before its first training run, but is dispatched
+    # only after a verified active generation pointer exists.
+    "enabled_models": ["almaz", "igor", "nova", "vega"],
 }
+
+
+def _predict_vega_advisory(deal_payload, conn):
+    """Import the optional runtime only after Vega has been activated."""
+
+    import vega_model_runtime
+
+    return vega_model_runtime.predict_deal(deal_payload, conn)
+
 
 MODEL_RUNNERS = {
     "almaz": price_model_runtime.predict_deal,
     "igor": igor_model_runtime.predict_deal,
     "nova": neural_model_runtime.predict_deal,
+    "vega": _predict_vega_advisory,
 }
+ADVISORY_MODEL_NAMES = frozenset({"vega"})
 MODEL_DEAL_SCHEMA_VERSION = 5
 VISIBLE_DEAL_VERDICTS = frozenset({"good", "watch"})
 SOURCE_STICKER = "sticker"
@@ -149,8 +166,12 @@ def scanner_instance_lock(path=None):
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             acquired = True
         except BlockingIOError as exc:
-            handle.seek(0)
-            owner = handle.read().strip() or "unknown"
+            try:
+                handle.seek(0)
+                owner = handle.read().strip() or "unknown"
+            except OSError:
+                # Windows byte-range locks also block reads of the locked byte.
+                owner = "unknown"
             raise RuntimeError(
                 f"deal_scanner is already running (lock owner: {owner})"
             ) from exc
@@ -190,13 +211,15 @@ def load_config():
 
 def validate_config(config):
     result = dict(config)
+    # This legacy value seeds scanner_control.json on first use. Keep the
+    # continuous (0) / bounded nonzero contract identical to live UI updates.
+    try:
+        result["scan_interval_seconds"] = scanner_control._coerce_interval(
+            result.get("scan_interval_seconds"), field_name="scan_interval_seconds"
+        )
+    except TypeError as exc:
+        raise ValueError(str(exc)) from exc
     integer_ranges = {
-        # This legacy value only seeds scanner_control.json on first use.
-        # Persistent UI updates use the same safety bounds.
-        "scan_interval_seconds": (
-            scanner_control.MIN_INTERVAL_SECONDS,
-            scanner_control.MAX_INTERVAL_SECONDS,
-        ),
         "stickers_per_cycle": (1, 1000),
         "listings_per_sticker": (1, 50),
         "listing_pages_per_sticker": (1, 10),
@@ -325,13 +348,76 @@ def scanner_target_profile_defaults(config):
     }
 
 
+def scanner_target_budget_defaults(config):
+    """Seed live per-profile cycle sizes from the legacy JSON config."""
+
+    fields = {
+        scanner_target_profiles.PROFILE_STICKER_GUNS: "stickers_per_cycle",
+        scanner_target_profiles.PROFILE_LIQUID_UNDER_10: "liquid_skins_per_cycle",
+        scanner_target_profiles.PROFILE_KNIVES: "knives_per_cycle",
+        scanner_target_profiles.PROFILE_GLOVES: "gloves_per_cycle",
+    }
+    return {
+        profile: int(config[field])
+        for profile, field in fields.items()
+    }
+
+
+def scanner_target_listing_defaults(config):
+    fields = {
+        scanner_target_profiles.PROFILE_STICKER_GUNS: "listings_per_sticker",
+        scanner_target_profiles.PROFILE_LIQUID_UNDER_10: "listings_per_liquid_skin",
+        scanner_target_profiles.PROFILE_KNIVES: "listings_per_knife",
+        scanner_target_profiles.PROFILE_GLOVES: "listings_per_glove",
+    }
+    return {
+        profile: int(config[field])
+        for profile, field in fields.items()
+    }
+
+
 def load_scanner_target_control(config, *, create_if_missing=False):
     """Read durable profile choices; malformed state remains fail-closed."""
 
     return scanner_control.get_scanner_target_control(
         profile_defaults=scanner_target_profile_defaults(config),
+        budget_defaults=scanner_target_budget_defaults(config),
+        listing_defaults=scanner_target_listing_defaults(config),
         create_if_missing=create_if_missing,
     )
+
+
+def scanner_profile_targets_per_cycle(target_control, profile, fallback):
+    settings = scanner_target_profiles.profile_settings(target_control, profile)
+    if not settings["enabled"]:
+        return 0
+    value = settings.get("targets_per_cycle")
+    return int(fallback if value is None else value)
+
+
+def scanner_profile_listings_per_target(target_control, profile, fallback):
+    settings = scanner_target_profiles.profile_settings(target_control, profile)
+    value = settings.get("listings_per_target")
+    return int(fallback if value is None else value)
+
+
+def apply_live_scanner_budgets(config, target_control):
+    """Overlay revisioned UI budgets without mutating startup configuration."""
+
+    result = dict(config)
+    fields = {
+        scanner_target_profiles.PROFILE_STICKER_GUNS: "listings_per_sticker",
+        scanner_target_profiles.PROFILE_LIQUID_UNDER_10: "listings_per_liquid_skin",
+        scanner_target_profiles.PROFILE_KNIVES: "listings_per_knife",
+        scanner_target_profiles.PROFILE_GLOVES: "listings_per_glove",
+    }
+    for profile, field in fields.items():
+        result[field] = scanner_profile_listings_per_target(
+            target_control,
+            profile,
+            config[field],
+        )
+    return result
 
 
 def connect_db():
@@ -594,6 +680,7 @@ def discover_sticker_targets(conn, config, target_control=None, *, apply_control
     where_parts = []
     params = []
     manual_ids = []
+    included_groups = set()
 
     for pattern in patterns:
         where_parts.append("name LIKE ?")
@@ -610,6 +697,15 @@ def discover_sticker_targets(conn, config, target_control=None, *, apply_control
         )
         if not settings["enabled"] and apply_control:
             return []
+        included_groups = set(settings.get("include_groups") or [])
+        for group in sorted(included_groups):
+            escaped = (
+                group.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            where_parts.append("name LIKE ? ESCAPE '\\'")
+            params.append(f"% | {escaped}")
         for key in settings["include"]:
             try:
                 sticker_id = int(key.split(":", 1)[1])
@@ -632,14 +728,9 @@ def discover_sticker_targets(conn, config, target_control=None, *, apply_control
         placeholders = ",".join("?" for _ in manual_ids)
         manual_order = f"CASE WHEN sticker_id IN ({placeholders}) THEN 0 ELSE 1 END,"
         order_params = list(manual_ids)
-    rows = [
-        {
-            **dict(row),
-            "source_type": SOURCE_STICKER,
-            "source_name": str(row["name"]),
-            "target_key": f"{SOURCE_STICKER}:{row['sticker_id']}",
-        }
-        for row in conn.execute(f"""
+    rows = []
+    query_limit = 25_000 if included_groups else limit + scanner_control.MAX_INCLUDED_TARGETS
+    for row in conn.execute(f"""
             SELECT
                 sticker_id,
                 name,
@@ -654,8 +745,19 @@ def discover_sticker_targets(conn, config, target_control=None, *, apply_control
             ORDER BY {manual_order}
                      max_price_cents DESC, avg_price_cents DESC, seen_count DESC
             LIMIT ?
-        """, [*params, *order_params, limit + scanner_control.MAX_INCLUDED_TARGETS])
-    ]
+        """, [*params, *order_params, query_limit]):
+        name = str(row["name"])
+        parts = [part.strip() for part in name.split(" | ")]
+        tournament = parts[-1] if len(parts) >= 3 and parts[-1] else None
+        rows.append(
+            {
+                **dict(row),
+                "source_type": SOURCE_STICKER,
+                "source_name": name,
+                "target_key": f"{SOURCE_STICKER}:{row['sticker_id']}",
+                "group_included": tournament in included_groups,
+            }
+        )
     if target_control is None:
         return rows[:limit]
     if not apply_control:
@@ -1710,6 +1812,10 @@ def enabled_model_names(config):
     names = []
     for name in config.get("enabled_models") or ["almaz", "igor"]:
         name = str(name).strip().lower()
+        if name == "vega" and model_generations.read_active_pointer(
+            "vega", project_dir=app_config.PROJECT_DIR
+        ) is None:
+            continue
         if name in MODEL_RUNNERS and name not in names:
             names.append(name)
     return names
@@ -1799,6 +1905,7 @@ def persist_model_result(
         if (
             eligible
             and saved
+            and model_name not in ADVISORY_MODEL_NAMES
             and str(prediction.get("verdict") or "") in VISIBLE_DEAL_VERDICTS
         ):
             deal_intelligence.record_recommendation(
@@ -2032,8 +2139,16 @@ def build_scanner_target_preview(
         )
         pool_limit = int(config["max_sticker_targets"])
         budget = {
-            "targets_per_cycle": config["stickers_per_cycle"],
-            "listings_per_target": config["listings_per_sticker"],
+            "targets_per_cycle": scanner_profile_targets_per_cycle(
+                target_control,
+                profile,
+                config["stickers_per_cycle"],
+            ),
+            "listings_per_target": scanner_profile_listings_per_target(
+                target_control,
+                profile,
+                config["listings_per_sticker"],
+            ),
             "pages_per_target": config["listing_pages_per_sticker"],
         }
         scan_ready = bool(config.get("enabled_models"))
@@ -2047,8 +2162,16 @@ def build_scanner_target_preview(
         )
         pool_limit = int(config["max_liquid_skin_targets"])
         budget = {
-            "targets_per_cycle": config["liquid_skins_per_cycle"],
-            "listings_per_target": config["listings_per_liquid_skin"],
+            "targets_per_cycle": scanner_profile_targets_per_cycle(
+                target_control,
+                profile,
+                config["liquid_skins_per_cycle"],
+            ),
+            "listings_per_target": scanner_profile_listings_per_target(
+                target_control,
+                profile,
+                config["listings_per_liquid_skin"],
+            ),
             "pages_per_target": config["listing_pages_per_liquid_skin"],
         }
         scan_ready = bool(config.get("enabled_models"))
@@ -2062,8 +2185,16 @@ def build_scanner_target_preview(
         )
         pool_limit = None
         budget = {
-            "targets_per_cycle": config["knives_per_cycle"],
-            "listings_per_target": config["listings_per_knife"],
+            "targets_per_cycle": scanner_profile_targets_per_cycle(
+                target_control,
+                profile,
+                config["knives_per_cycle"],
+            ),
+            "listings_per_target": scanner_profile_listings_per_target(
+                target_control,
+                profile,
+                config["listings_per_knife"],
+            ),
             "pages_per_target": config["listing_pages_per_knife"],
         }
         status = _knife_model_scan_status()
@@ -2078,8 +2209,16 @@ def build_scanner_target_preview(
         )
         pool_limit = None
         budget = {
-            "targets_per_cycle": config["gloves_per_cycle"],
-            "listings_per_target": config["listings_per_glove"],
+            "targets_per_cycle": scanner_profile_targets_per_cycle(
+                target_control,
+                profile,
+                config["gloves_per_cycle"],
+            ),
+            "listings_per_target": scanner_profile_listings_per_target(
+                target_control,
+                profile,
+                config["listings_per_glove"],
+            ),
             "pages_per_target": config["listing_pages_per_glove"],
         }
         status = _glove_model_scan_status()
@@ -2407,49 +2546,53 @@ def _scan_target(
                     "model_name": stale_model_name,
                 }
             )
-        for model_name in listing_model_names:
-            model_saved.setdefault(model_name, 0)
-            _check_scan_control(should_continue, heartbeat)
-            try:
-                runner = (
-                    knife_model_runtime.predict_deal
-                    if model_name == KNIFE_MODEL_NAME
-                    else (
-                        glove_model_runtime.predict_deal
-                        if model_name == GLOVE_MODEL_NAME
-                        else MODEL_RUNNERS[model_name]
+        # Igor, Nova and Vega share parsing, reference enrichment and base
+        # features.  Scope reuse to this observation; model-specific history
+        # and encodings are still applied independently by each runtime.
+        with igor_model_runtime.feature_preparation_cache():
+            for model_name in listing_model_names:
+                model_saved.setdefault(model_name, 0)
+                _check_scan_control(should_continue, heartbeat)
+                try:
+                    runner = (
+                        knife_model_runtime.predict_deal
+                        if model_name == KNIFE_MODEL_NAME
+                        else (
+                            glove_model_runtime.predict_deal
+                            if model_name == GLOVE_MODEL_NAME
+                            else MODEL_RUNNERS[model_name]
+                        )
                     )
-                )
-                prediction = runner(deal_payload, conn)
-            except Exception as exc:  # noqa: BLE001 - isolate independent model failures
+                    prediction = runner(deal_payload, conn)
+                except Exception as exc:  # noqa: BLE001 - isolate independent model failures
+                    actions.append({
+                        "kind": "invalidate",
+                        "listing_id": listing_id,
+                        "model_name": model_name,
+                        "error": f"{listing_id or 'unknown'}:{model_name}: {exc}",
+                    })
+                    continue
+
+                try:
+                    stored_prediction, eligible = prediction_for_storage(prediction, config)
+                except Exception as exc:  # noqa: BLE001 - keep other model results usable
+                    actions.append({
+                        "kind": "invalidate",
+                        "listing_id": listing_id,
+                        "model_name": model_name,
+                        "error": f"{listing_id or 'unknown'}:{model_name}:store: {exc}",
+                    })
+                    continue
+
                 actions.append({
-                    "kind": "invalidate",
+                    "kind": "persist",
                     "listing_id": listing_id,
                     "model_name": model_name,
-                    "error": f"{listing_id or 'unknown'}:{model_name}: {exc}",
+                    "listing_data": listing_data,
+                    "prediction": stored_prediction,
+                    "eligible": eligible,
+                    "meta": listing_meta,
                 })
-                continue
-
-            try:
-                stored_prediction, eligible = prediction_for_storage(prediction, config)
-            except Exception as exc:  # noqa: BLE001 - keep other model results usable
-                actions.append({
-                    "kind": "invalidate",
-                    "listing_id": listing_id,
-                    "model_name": model_name,
-                    "error": f"{listing_id or 'unknown'}:{model_name}:store: {exc}",
-                })
-                continue
-
-            actions.append({
-                "kind": "persist",
-                "listing_id": listing_id,
-                "model_name": model_name,
-                "listing_data": listing_data,
-                "prediction": stored_prediction,
-                "eligible": eligible,
-                "meta": listing_meta,
-            })
 
     _check_scan_control(should_continue, heartbeat)
     errors = []
@@ -2768,6 +2911,8 @@ def install_signal_handlers(stop_event=None):
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
+    import windows_service_control
+    windows_service_control.register_stop_callback(event.set)
 
 
 def run_forever(*, stop_event=None):
@@ -2792,6 +2937,7 @@ def run_forever(*, stop_event=None):
             config,
             create_if_missing=False,
         )
+        live_scan_config = apply_live_scanner_budgets(config, target_control)
         profile_enabled = {
             name: scanner_target_profiles.profile_settings(
                 target_control,
@@ -2799,26 +2945,28 @@ def run_forever(*, stop_event=None):
             )["enabled"]
             for name in scanner_target_profiles.PROFILE_ORDER
         }
-        default_interval = int(config.get("scan_interval_seconds") or 600)
-        stickers_per_cycle = (
-            int(config.get("stickers_per_cycle") or 5)
-            if profile_enabled[scanner_target_profiles.PROFILE_STICKER_GUNS]
-            else 0
+        default_interval = int(
+            config.get("scan_interval_seconds", DEFAULT_CONFIG["scan_interval_seconds"])
         )
-        liquid_skins_per_cycle = (
-            int(config.get("liquid_skins_per_cycle") or 1)
-            if profile_enabled[scanner_target_profiles.PROFILE_LIQUID_UNDER_10]
-            else 0
+        stickers_per_cycle = scanner_profile_targets_per_cycle(
+            target_control,
+            scanner_target_profiles.PROFILE_STICKER_GUNS,
+            config["stickers_per_cycle"],
         )
-        knives_per_cycle = (
-            int(config.get("knives_per_cycle") or 1)
-            if profile_enabled[scanner_target_profiles.PROFILE_KNIVES]
-            else 0
+        liquid_skins_per_cycle = scanner_profile_targets_per_cycle(
+            target_control,
+            scanner_target_profiles.PROFILE_LIQUID_UNDER_10,
+            config["liquid_skins_per_cycle"],
         )
-        gloves_per_cycle = (
-            int(config.get("gloves_per_cycle") or 1)
-            if profile_enabled[scanner_target_profiles.PROFILE_GLOVES]
-            else 0
+        knives_per_cycle = scanner_profile_targets_per_cycle(
+            target_control,
+            scanner_target_profiles.PROFILE_KNIVES,
+            config["knives_per_cycle"],
+        )
+        gloves_per_cycle = scanner_profile_targets_per_cycle(
+            target_control,
+            scanner_target_profiles.PROFILE_GLOVES,
+            config["gloves_per_cycle"],
         )
         knife_rediscovery_cycles = int(
             config.get("knife_rediscovery_cycles") or 6
@@ -2969,6 +3117,10 @@ def run_forever(*, stop_event=None):
                     # profile and cannot spend quota on the previous list.
                     target_control = latest_target_control
                     target_control_identity = latest_target_identity
+                    live_scan_config = apply_live_scanner_budgets(
+                        config,
+                        target_control,
+                    )
                     profile_enabled = {
                         name: scanner_target_profiles.profile_settings(
                             target_control,
@@ -2976,29 +3128,25 @@ def run_forever(*, stop_event=None):
                         )["enabled"]
                         for name in scanner_target_profiles.PROFILE_ORDER
                     }
-                    stickers_per_cycle = (
-                        int(config.get("stickers_per_cycle") or 5)
-                        if profile_enabled[
-                            scanner_target_profiles.PROFILE_STICKER_GUNS
-                        ]
-                        else 0
+                    stickers_per_cycle = scanner_profile_targets_per_cycle(
+                        target_control,
+                        scanner_target_profiles.PROFILE_STICKER_GUNS,
+                        config["stickers_per_cycle"],
                     )
-                    liquid_skins_per_cycle = (
-                        int(config.get("liquid_skins_per_cycle") or 1)
-                        if profile_enabled[
-                            scanner_target_profiles.PROFILE_LIQUID_UNDER_10
-                        ]
-                        else 0
+                    liquid_skins_per_cycle = scanner_profile_targets_per_cycle(
+                        target_control,
+                        scanner_target_profiles.PROFILE_LIQUID_UNDER_10,
+                        config["liquid_skins_per_cycle"],
                     )
-                    knives_per_cycle = (
-                        int(config.get("knives_per_cycle") or 1)
-                        if profile_enabled[scanner_target_profiles.PROFILE_KNIVES]
-                        else 0
+                    knives_per_cycle = scanner_profile_targets_per_cycle(
+                        target_control,
+                        scanner_target_profiles.PROFILE_KNIVES,
+                        config["knives_per_cycle"],
                     )
-                    gloves_per_cycle = (
-                        int(config.get("gloves_per_cycle") or 1)
-                        if profile_enabled[scanner_target_profiles.PROFILE_GLOVES]
-                        else 0
+                    gloves_per_cycle = scanner_profile_targets_per_cycle(
+                        target_control,
+                        scanner_target_profiles.PROFILE_GLOVES,
+                        config["gloves_per_cycle"],
                     )
                     sticker_targets = []
                     liquid_skin_targets = []
@@ -3257,7 +3405,7 @@ def run_forever(*, stop_event=None):
                         returned, saved, meta, model_saved = scan_function(
                             conn,
                             target,
-                            config,
+                            live_scan_config,
                             should_continue=scan_allowed,
                             heartbeat=scan_heartbeat,
                             cycle_seen_listing_ids=cycle_seen_listing_ids,
@@ -3345,7 +3493,10 @@ def run_forever(*, stop_event=None):
                         cycle_listings_returned=cycle_listings_returned,
                         cycle_candidates_saved=cycle_candidates_saved,
                     )
-                    if event.wait(CONTROL_POLL_SECONDS):
+                    # Control is re-read before every network/model boundary;
+                    # an extra one-second sleep after every completed target
+                    # only slowed a full rotation without improving safety.
+                    if event.is_set():
                         interrupted = True
                         break
                     if rate_exhausted:

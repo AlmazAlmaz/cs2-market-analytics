@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor, Pool
+from catboost.utils import get_gpu_device_count
 
 try:
     from . import build_cache, feature_contract, features
@@ -29,6 +30,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
+import app_config
 import model_generations
 from item_classification import (
     ITEM_KIND_WEAPON_SKIN,
@@ -46,6 +48,13 @@ ARTIFACT_VERSION = 2
 PRIMARY_RUNTIME_MAX_FETCH_LAG_SECONDS = 24 * 60 * 60
 MIN_PRIMARY_HOLDOUT_ROWS = 500
 MIN_SEGMENT_HOLDOUT_ROWS = 30
+# Leave a material validation-side buffer below the promotion limit (1%).
+# CatBoost trains point/q15/q85 independently, so an otherwise excellent point
+# model can occasionally sit just outside the two raw quantiles.  The deployed
+# runtime already envelopes all three predictions; calibrating the raw interval
+# here makes the validation and promotion contracts agree without looking at
+# the untouched test set.
+VALIDATION_POINT_OUTSIDE_TARGET = 0.006
 
 
 def parse_args(argv=None):
@@ -84,11 +93,45 @@ def parse_args(argv=None):
     parser.add_argument("--max-train-rows", type=int)
     parser.add_argument("--thread-count", type=int, default=THREAD_COUNT)
     parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default=app_config.get("CS2_TRAINING_DEVICE", "auto").lower() or "auto",
+        help="Training accelerator: auto prefers an NVIDIA GPU when CatBoost can use it",
+    )
+    parser.add_argument(
+        "--gpu-devices",
+        default=app_config.get("CS2_CUDA_DEVICES", "0") or "0",
+        help="CatBoost CUDA device list, for example 0 or 0:1",
+    )
+    parser.add_argument(
         "--rebuild-cache",
         action="store_true",
         help="Atomically rebuild the default cache from one SQLite snapshot before fit",
     )
     return parser.parse_args(argv)
+
+
+def choose_training_device(requested: str) -> str:
+    """Resolve the CatBoost task type without silently ignoring explicit CUDA."""
+
+    requested = str(requested).strip().lower()
+    if requested not in {"auto", "cpu", "cuda"}:
+        raise ValueError(f"unsupported training device: {requested!r}")
+    if requested == "cpu":
+        return "CPU"
+    try:
+        gpu_count = int(get_gpu_device_count())
+    except Exception as exc:
+        if requested == "cuda":
+            raise RuntimeError("CatBoost could not query CUDA devices") from exc
+        gpu_count = 0
+    if gpu_count > 0:
+        return "GPU"
+    if requested == "cuda":
+        raise RuntimeError(
+            "CUDA was requested for Igor, but CatBoost found no compatible NVIDIA GPU"
+        )
+    return "CPU"
 
 
 def load_cache(path: Path) -> pd.DataFrame:
@@ -278,9 +321,11 @@ def model_params(
     loss_function: str,
     thread_count: int,
     *,
+    task_type: str = "CPU",
+    gpu_devices: str = "0",
     verbose_period: int = 250,
 ) -> dict:
-    return {
+    params = {
         "loss_function": loss_function,
         "iterations": iterations,
         "learning_rate": 0.06 if loss_function == "MAE" else 0.07,
@@ -292,6 +337,11 @@ def model_params(
         "verbose": max(1, int(verbose_period)),
         "allow_writing_files": False,
     }
+    if task_type == "GPU":
+        params.update({"task_type": "GPU", "devices": gpu_devices})
+    else:
+        params["task_type"] = "CPU"
+    return params
 
 
 def train_model(
@@ -301,6 +351,8 @@ def train_model(
     iterations,
     loss,
     thread_count,
+    task_type="CPU",
+    gpu_devices="0",
     verbose_period=250,
 ):
     model = CatBoostRegressor(
@@ -308,6 +360,8 @@ def train_model(
             iterations,
             loss,
             thread_count,
+            task_type=task_type,
+            gpu_devices=gpu_devices,
             verbose_period=verbose_period,
         )
     )
@@ -336,11 +390,72 @@ def calibrate_predictions(point, low, high, validation: pd.DataFrame) -> dict:
         if best is None or score < best[0]:
             best = (score, float(scale), center_offset, metrics)
     scale = best[1]
+    center_offset = best[2]
+    low_offset = float(np.quantile(target - low * scale, 0.15))
+    high_offset = float(np.quantile(target - high * scale, 0.85))
+
+    calibrated_center = point * scale + center_offset
+    calibrated_low = low * scale + low_offset
+    calibrated_high = high * scale + high_offset
+    ordered_low = np.minimum(calibrated_low, calibrated_high)
+    ordered_high = np.maximum(calibrated_low, calibrated_high)
+    outside_before = float(
+        np.mean(
+            (calibrated_center < ordered_low)
+            | (calibrated_center > ordered_high)
+        )
+    )
+    # ``method='higher'`` is deliberately conservative: the selected observed
+    # gap is never interpolated down.  Calibrate the named q15 and q85 sides
+    # separately: if they cross, widening only the current min/max can move the
+    # wrong named side and leave the point outside after the swap.
+    side_quantile = 1.0 - VALIDATION_POINT_OUTSIDE_TARGET / 2.0
+    low_margin = float(
+        np.quantile(
+            np.maximum(calibrated_low - calibrated_center, 0),
+            side_quantile,
+            method="higher",
+        )
+    )
+    high_margin = float(
+        np.quantile(
+            np.maximum(calibrated_center - calibrated_high, 0),
+            side_quantile,
+            method="higher",
+        )
+    )
+    if low_margin > 0:
+        # Make the widened boundary inclusive even after the two independent
+        # floating-point additions below.
+        low_margin = float(np.nextafter(low_margin, np.inf))
+    if high_margin > 0:
+        high_margin = float(np.nextafter(high_margin, np.inf))
+    low_offset -= low_margin
+    high_offset += high_margin
+    widened_low = np.minimum(
+        low * scale + low_offset,
+        high * scale + high_offset,
+    )
+    widened_high = np.maximum(
+        low * scale + low_offset,
+        high * scale + high_offset,
+    )
+    outside_after = float(
+        np.mean(
+            (calibrated_center < widened_low)
+            | (calibrated_center > widened_high)
+        )
+    )
     return {
         "premium_scale": scale,
-        "center_offset": best[2],
-        "low_offset": float(np.quantile(target - low * scale, 0.15)),
-        "high_offset": float(np.quantile(target - high * scale, 0.85)),
+        "center_offset": center_offset,
+        "low_offset": low_offset,
+        "high_offset": high_offset,
+        "point_containment_margin": max(low_margin, high_margin),
+        "low_point_containment_margin": low_margin,
+        "high_point_containment_margin": high_margin,
+        "validation_point_outside_raw_rate_before": outside_before,
+        "validation_point_outside_raw_rate_after": outside_after,
         "validation_metrics": best[3],
     }
 
@@ -536,6 +651,13 @@ def atomic_save_model(model, path: Path) -> None:
 
 def main(argv=None):
     args = parse_args(argv)
+    task_type = choose_training_device(args.device)
+    device_label = (
+        f"cuda (CatBoost GPU devices={args.gpu_devices})"
+        if task_type == "GPU"
+        else "cpu"
+    )
+    print(f"device: {device_label}", flush=True)
     if not 0.01 <= float(args.test_fraction) <= 0.25:
         raise ValueError("--test-fraction must be between 0.01 and 0.25")
     if args.test_rows is not None and args.test_rows < MIN_PRIMARY_HOLDOUT_ROWS:
@@ -628,6 +750,8 @@ def main(argv=None):
         iterations=args.point_iterations,
         loss="MAE",
         thread_count=args.thread_count,
+        task_type=task_type,
+        gpu_devices=args.gpu_devices,
         verbose_period=args.verbose_period,
     )
     print(
@@ -641,6 +765,8 @@ def main(argv=None):
         iterations=args.quantile_iterations,
         loss="Quantile:alpha=0.15",
         thread_count=args.thread_count,
+        task_type=task_type,
+        gpu_devices=args.gpu_devices,
         verbose_period=args.verbose_period,
     )
     print(
@@ -654,6 +780,8 @@ def main(argv=None):
         iterations=args.quantile_iterations,
         loss="Quantile:alpha=0.85",
         thread_count=args.thread_count,
+        task_type=task_type,
+        gpu_devices=args.gpu_devices,
         verbose_period=args.verbose_period,
     )
     print(
@@ -804,6 +932,7 @@ def main(argv=None):
             "q15": int(low.tree_count_),
             "q85": int(high.tree_count_),
         },
+        "training_device": device_label,
     }
     metrics = {
         "artifact_version": ARTIFACT_VERSION,
@@ -854,6 +983,7 @@ def main(argv=None):
             "point_outside_raw_rate"
         ],
         "production_promoted": False,
+        "training_device": device_label,
     }
 
     atomic_save_model(point, artifact_dir / "price_model_point.cbm")

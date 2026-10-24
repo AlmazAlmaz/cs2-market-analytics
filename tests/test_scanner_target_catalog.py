@@ -275,3 +275,175 @@ def test_post_contract_is_strict_revisioned_and_returns_ui_metadata(tmp_path):
         "knives",
         "gloves",
     ]
+
+
+def test_liquid_preview_batches_catalog_lookups_and_preserves_classification(tmp_path):
+    names = [f"AK-47 | Bulk {index} (Field-Tested)" for index in range(1100)]
+    names.extend(["Catalog-only weapon", "AK-47 | Invalid kind (Field-Tested)"])
+    (tmp_path / "skins.json").write_text(
+        json.dumps(
+            [
+                {"market_hash_name": name, "base_price_usd": 5, "quantity_on_market": 1}
+                for name in names
+            ]
+        ),
+        encoding="utf-8",
+    )
+    conn = memory_db()
+    conn.execute(
+        "CREATE TABLE cs2_item_catalog "
+        "(market_hash_name TEXT PRIMARY KEY, item_kind TEXT)"
+    )
+    conn.executemany(
+        "INSERT INTO cs2_item_catalog VALUES (?, ?)",
+        [
+            (names[0], "glove"),
+            ("Catalog-only weapon", "weapon_skin"),
+            ("AK-47 | Invalid kind (Field-Tested)", "invalid"),
+        ],
+    )
+    traces = []
+    conn.set_trace_callback(traces.append)
+
+    rows = scanner_target_catalog.load_profile_candidates(
+        conn, "liquid_under_10", config(tmp_path), control()
+    )
+
+    assert {row["name"] for row in rows} == set(names) - {names[0]}
+    catalog_lookups = [
+        query for query in traces if "SELECT market_hash_name, item_kind" in query
+    ]
+    assert len(catalog_lookups) == 3
+    assert not any("WHERE market_hash_name = " in query for query in traces)
+
+
+def test_sticker_group_cache_refreshes_selection_expiry_and_database_changes(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(scanner_target_catalog, "_sticker_group_cache", {})
+    db_path = tmp_path / "history.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE sale_stickers (sticker_id INTEGER, name TEXT)")
+        conn.execute(
+            "INSERT INTO sale_stickers VALUES (1, 'Sticker | Team | Katowice 2014')"
+        )
+    calls = []
+    original = scanner_target_catalog._sticker_group_catalog
+
+    def counted_catalog(conn):
+        calls.append(True)
+        return original(conn)
+
+    clock = [100.0]
+    monkeypatch.setattr(scanner_target_catalog, "_sticker_group_catalog", counted_catalog)
+    monkeypatch.setattr(scanner_target_catalog.time, "monotonic", lambda: clock[0])
+    target_control = control()
+
+    def preview():
+        return scanner_target_catalog.build_scanner_target_preview(
+            db_path,
+            "sticker_guns",
+            config=config(tmp_path),
+            target_control=target_control,
+        )
+
+    assert preview()["groups"][0]["selected"] is False
+    target_control["profiles"]["sticker_guns"]["include_groups"] = ["Katowice 2014"]
+    assert preview()["groups"][0]["selected"] is True
+    assert len(calls) == 1
+
+    clock[0] += scanner_target_catalog.STICKER_GROUP_CACHE_TTL_SECONDS + 1
+    assert preview()["groups"][0]["target_count"] == 1
+    assert len(calls) == 2
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO sale_stickers VALUES (2, 'Sticker | Second | Katowice 2014')"
+        )
+    assert preview()["groups"][0]["target_count"] == 2
+    assert len(calls) == 3
+
+    second_path = tmp_path / "other.db"
+    with sqlite3.connect(second_path) as conn:
+        conn.execute("CREATE TABLE sale_stickers (sticker_id INTEGER, name TEXT)")
+    empty = scanner_target_catalog.build_scanner_target_preview(
+        second_path,
+        "sticker_guns",
+        config=config(tmp_path),
+        target_control=target_control,
+    )
+    assert empty["groups"] == []
+    assert len(calls) == 4
+
+
+def test_sticker_group_cache_refreshes_wal_updates_without_checkpoint(tmp_path, monkeypatch):
+    monkeypatch.setattr(scanner_target_catalog, "_sticker_group_cache", {})
+    clock = [100.0]
+    monkeypatch.setattr(scanner_target_catalog.time, "monotonic", lambda: clock[0])
+    db_path = tmp_path / "wal-history.db"
+    writer = sqlite3.connect(db_path)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE sale_stickers (sticker_id INTEGER, name TEXT)")
+        writer.execute(
+            "INSERT INTO sale_stickers VALUES (1, 'Sticker | Team | Katowice 2014')"
+        )
+        writer.commit()
+
+        def preview():
+            return scanner_target_catalog.build_scanner_target_preview(
+                db_path,
+                "sticker_guns",
+                config=config(tmp_path),
+                target_control=control(),
+            )
+
+        first = preview()
+        assert first["groups"][0]["target_count"] == 1
+        # Mutating a response must not mutate the shared cached catalog.
+        first["groups"][0]["target_count"] = 999
+        assert preview()["groups"][0]["target_count"] == 1
+        main_stat = db_path.stat()
+        writer.execute(
+            "INSERT INTO sale_stickers VALUES (2, 'Sticker | Second | Katowice 2014')"
+        )
+        writer.commit()
+        assert db_path.stat().st_mtime_ns == main_stat.st_mtime_ns
+        assert db_path.stat().st_size == main_stat.st_size
+        clock[0] += scanner_target_catalog.STICKER_GROUP_CACHE_TTL_SECONDS + 1
+        assert preview()["groups"][0]["target_count"] == 2
+    finally:
+        writer.close()
+
+
+def test_sticker_group_cache_stays_bounded_across_databases(tmp_path, monkeypatch):
+    monkeypatch.setattr(scanner_target_catalog, "_sticker_group_cache", {})
+    monkeypatch.setattr(scanner_target_catalog, "MAX_STICKER_GROUP_CACHE_ENTRIES", 2)
+    calls = []
+    original = scanner_target_catalog._sticker_group_catalog
+
+    def counted_catalog(conn):
+        calls.append(True)
+        return original(conn)
+
+    monkeypatch.setattr(scanner_target_catalog, "_sticker_group_catalog", counted_catalog)
+    paths = [tmp_path / f"history-{index}.db" for index in range(3)]
+    for path in paths:
+        sqlite3.connect(path).close()
+        scanner_target_catalog.build_scanner_target_preview(
+            path,
+            "sticker_guns",
+            config=config(tmp_path),
+            target_control=control(),
+        )
+        assert len(scanner_target_catalog._sticker_group_cache) <= 2
+    assert len(calls) == 3
+    scanner_target_catalog.build_scanner_target_preview(
+        paths[0],
+        "sticker_guns",
+        config=config(tmp_path),
+        target_control=control(),
+    )
+    assert len(calls) == 4
+    assert len(scanner_target_catalog._sticker_group_cache) <= 2

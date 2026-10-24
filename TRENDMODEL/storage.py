@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 2
-MODEL_VERSION = "trend_pooled_v1"
+MODEL_VERSION = "trend_pooled_v2"
 UNKNOWN_COLLECTION = "Unknown"
 
 

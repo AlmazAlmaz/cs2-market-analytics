@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 
 import argparse
-import fcntl
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    import portable_fcntl as fcntl
 import hashlib
 import json
 import math
@@ -810,7 +814,10 @@ def sleep_with_message(seconds, reason):
             break
 
         step = min(60.0, remaining)
-        time.sleep(step)
+        # Hidden Windows services receive a cooperative request instead of a
+        # console Ctrl+C, so their long quota sleeps must be wakeable as well.
+        import windows_service_control
+        windows_service_control.wait_for_stop(step)
 
         remaining_after_sleep = deadline - time.monotonic()
         if remaining_after_sleep > 0 and seconds >= 60:
@@ -3467,13 +3474,19 @@ def parser_instance_lock():
     lock_path = Path(LOCK_PATH)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+", encoding="utf-8")
+    acquired = False
     try:
         lock_path.chmod(0o600)
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
         except BlockingIOError as exc:
-            handle.seek(0)
-            owner = handle.read().strip() or "unknown"
+            try:
+                handle.seek(0)
+                owner = handle.read().strip() or "unknown"
+            except OSError:
+                # Windows byte-range locks also block reads of the locked byte.
+                owner = "unknown"
             raise RuntimeError(
                 f"parser_final is already running (lock owner: {owner})"
             ) from exc
@@ -3485,7 +3498,8 @@ def parser_instance_lock():
         yield
     finally:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if acquired:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
 
@@ -3582,6 +3596,10 @@ def main(argv=None):
             status_owned = True
             signal.signal(signal.SIGINT, request_parser_stop)
             signal.signal(signal.SIGTERM, request_parser_stop)
+            import windows_service_control
+            windows_service_control.register_stop_callback(
+                lambda: request_parser_stop(signal.SIGINT, None)
+            )
             started_at = iso_now()
             update_parser_state(
                 status_version=PARSER_STATUS_VERSION,

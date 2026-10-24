@@ -33,6 +33,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import portable_os
+
 from item_classification import (  # stable public re-export
     ITEM_KIND_GLOVE,
     ITEM_KIND_KNIFE,
@@ -1604,11 +1606,7 @@ def fetch_json_source(
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    portable_os.fsync_directory(path)
 
 
 def _atomic_write(path: Path, value: bytes) -> None:
@@ -1618,7 +1616,7 @@ def _atomic_write(path: Path, value: bytes) -> None:
     )
     temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, 0o600)
+        portable_os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(value)
             handle.flush()

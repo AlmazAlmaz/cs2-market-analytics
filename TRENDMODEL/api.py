@@ -21,7 +21,6 @@ member view, and ``get_skin_daily_series`` returns one bounded price history.
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -30,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 import app_config
+import portable_os
 
 from .backtest import BacktestConfig
 from .storage import SCHEMA_VERSION, canonical_sha256
@@ -112,13 +112,7 @@ def get_trend_pipeline_status(
     except (TypeError, ValueError):
         pass
     pid = value.get("pid")
-    process_alive = False
-    if isinstance(pid, int) and pid > 0:
-        try:
-            os.kill(pid, 0)
-            process_alive = True
-        except (OSError, ValueError):
-            pass
+    process_alive = portable_os.process_alive(pid)
     value["heartbeat_age_seconds"] = (
         round(age_seconds, 3) if age_seconds is not None else None
     )

@@ -23,6 +23,7 @@ MAX_ANNOTATION_ROWS = 500
 MAX_PORTFOLIO_CANDIDATES = 500
 MIN_SEGMENT_MODEL_SAMPLES = 24
 MIN_SEGMENT_SALE_OUTCOMES = 30
+ADVISORY_MODEL_NAMES = frozenset({"vega"})
 
 RISK_PROFILES = {
     "conservative": {
@@ -646,7 +647,12 @@ def _prediction_rows(predictions):
             continue
         model_name = str(raw.get("model_name") or "").strip().lower()
         point = _int(raw.get("predicted_price_cents"))
-        if not model_name or point is None or point <= 0:
+        if (
+            not model_name
+            or model_name in ADVISORY_MODEL_NAMES
+            or point is None
+            or point <= 0
+        ):
             continue
         item = dict(raw)
         item["model_name"] = model_name
@@ -990,6 +996,7 @@ def refresh_listing_intelligence(conn, listing_id, *, profile=None, now=None):
             """
             SELECT * FROM model_deal_predictions
             WHERE listing_id = ? AND verdict IN ('good', 'watch')
+                AND model_name != 'vega'
             ORDER BY model_name
             """,
             (listing_id,),

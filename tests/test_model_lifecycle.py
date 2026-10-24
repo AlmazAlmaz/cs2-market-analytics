@@ -1,9 +1,19 @@
 import json
+import os
 import stat
 
 import pytest
 
 import model_lifecycle
+
+
+def _symlink_or_skip(link, target, *, target_is_directory=False):
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is not enabled")
+        raise
 
 
 def _journal_record():
@@ -48,7 +58,8 @@ def test_service_start_fails_closed_while_durable_journal_exists(tmp_path):
     )
 
     assert json.loads(path.read_text(encoding="utf-8")) == written
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
     with (
         pytest.raises(model_lifecycle.ModelLifecycleError, match="journal"),
         model_lifecycle.service_lifetime_lock("dashboard", project_dir=tmp_path),
@@ -72,7 +83,10 @@ def test_journal_rejects_reserved_schema_and_dangling_symlink(tmp_path):
 
     run_dir = tmp_path / ".run" / "model_lifecycle"
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / model_lifecycle.JOURNAL_FILENAME).symlink_to("missing.json")
+    _symlink_or_skip(
+        run_dir / model_lifecycle.JOURNAL_FILENAME,
+        "missing.json",
+    )
     with pytest.raises(model_lifecycle.ModelLifecycleError, match="symlink"):
         model_lifecycle.read_promotion_journal(project_dir=tmp_path)
 

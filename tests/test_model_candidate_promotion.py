@@ -1,6 +1,7 @@
 import hashlib
 import inspect
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,14 @@ class FakePipeline:
 
 def _sha(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def test_sha256_file_hashes_exact_binary_bytes_on_windows(tmp_path):
+    payload = b"pytorch\r\n\x1a\x00\xff\r\nartifact"
+    artifact = tmp_path / "artifact.bin"
+    artifact.write_bytes(payload)
+
+    assert promotion._sha256_file(artifact) == hashlib.sha256(payload).hexdigest()
 
 
 def _profile(monkeypatch, tmp_path: Path, model: str):
@@ -891,7 +900,12 @@ def test_check_rejects_declared_sha_mismatch_and_symlinks(tmp_path, monkeypatch)
     model_path = profile.candidate_dir / profile.model_filename
     real_path = profile.candidate_dir / "real-state.pt"
     model_path.replace(real_path)
-    model_path.symlink_to(real_path.name)
+    try:
+        model_path.symlink_to(real_path.name)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is not enabled")
+        raise
     with pytest.raises(promotion.PromotionError, match="symlink"):
         promotion.validate_candidate("nova")
 

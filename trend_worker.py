@@ -26,8 +26,8 @@ from TRENDMODEL.storage import (
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - the one-command launcher targets macOS/Linux
-    fcntl = None
+except ImportError:  # Windows
+    import portable_fcntl as fcntl
 
 
 PROJECT_DIR = app_config.PROJECT_DIR
@@ -234,6 +234,8 @@ def main() -> int:
         stop = threading.Event()
         for signum in (signal.SIGINT, signal.SIGTERM):
             signal.signal(signum, lambda *_args: stop.set())
+        import windows_service_control
+        windows_service_control.register_stop_callback(stop.set)
         status = WorkerStatus(
             args.status_path,
             args.source_db,

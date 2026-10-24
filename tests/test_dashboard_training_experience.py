@@ -2,14 +2,15 @@ import dashboard_server
 import scanner_target_catalog
 
 
-def test_training_workspace_has_five_isolated_models_and_a_clear_process():
+def test_training_workspace_has_six_models_and_a_clear_process():
     template = dashboard_server.HTML
 
     assert (
-        "Object.freeze(['almaz', 'igor', 'nova', 'knives', 'gloves'])"
+        "Object.freeze(['almaz', 'igor', 'nova', 'vega', 'knives', 'gloves'])"
         in template
     )
     assert "weapon skins only" in template
+    assert "advisory Vega" in template
     assert "knives only" in template
     assert "gloves only" in template
     for stage in ("data", "features", "train", "quality", "activation"):

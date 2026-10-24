@@ -1,6 +1,7 @@
 import hashlib
 import json
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -50,8 +51,16 @@ def test_health_reports_dedicated_knife_model_separately(monkeypatch, tmp_path):
     payload = dashboard_server.build_health_payload()
 
     assert payload["ok"] is True
-    assert set(payload["models"]) == {"almaz", "igor", "nova", "knives"}
+    assert set(payload["models"]) == {
+        "almaz",
+        "igor",
+        "nova",
+        "vega",
+        "knives",
+        "gloves",
+    }
     assert payload["models"]["knives"] is True
+    assert payload["models"]["vega"] is False
 
 
 def test_private_pages_share_navigation_and_design_without_token_leaks():
@@ -345,6 +354,101 @@ def test_manual_comparison_routes_knives_only_to_dedicated_model(monkeypatch):
     assert result["comparison"]["confidence"] == "single_signal"
 
 
+def test_manual_comparison_keeps_active_vega_advisory_out_of_core_decision(
+    monkeypatch,
+):
+    import igor_model_runtime
+    import neural_model_runtime
+    import price_model_runtime
+
+    conn = sqlite3.connect(":memory:")
+    monkeypatch.setattr(dashboard_server, "connect_db", lambda: conn)
+    monkeypatch.setattr(
+        model_generations,
+        "read_active_pointer",
+        lambda model, **_kwargs: {"generation_id": "a" * 64}
+        if model == "vega"
+        else None,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vega_model_runtime",
+        SimpleNamespace(
+            predict_deal=lambda _payload, _conn: manual_prediction(
+                "vega", 9_000, 760, "bad"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        price_model_runtime,
+        "predict_deal",
+        lambda _payload, _conn: manual_prediction("almaz", 1_400, 34.4, "good"),
+    )
+    monkeypatch.setattr(
+        igor_model_runtime,
+        "predict_deal",
+        lambda _payload, _conn: manual_prediction("igor", 1_100, 5.6, "watch"),
+    )
+    monkeypatch.setattr(
+        neural_model_runtime,
+        "predict_deal",
+        lambda _payload, _conn: manual_prediction("nova", 1_300, 24.8, "good"),
+    )
+
+    result = dashboard_server.build_predict_deal_payload(
+        {"name": "AK-47 | Slate (Field-Tested)", "buy_price_cents": 1_000}
+    )
+
+    assert result["selected_model"] == "igor"
+    assert result["comparison"]["confidence"] == "unanimous_three"
+    assert result["comparison"]["dissenting_models"] == []
+    assert result["comparison"]["advisory_models"] == ["vega"]
+    assert result["comparison"]["positive_advisory_models"] == []
+    assert result["comparison"]["prediction_spread_cents"] == 300
+
+
+def test_manual_comparison_never_promotes_vega_when_all_core_models_fail(
+    monkeypatch,
+):
+    import igor_model_runtime
+    import neural_model_runtime
+    import price_model_runtime
+
+    conn = sqlite3.connect(":memory:")
+    monkeypatch.setattr(dashboard_server, "connect_db", lambda: conn)
+    monkeypatch.setattr(
+        model_generations,
+        "read_active_pointer",
+        lambda model, **_kwargs: {"generation_id": "a" * 64}
+        if model == "vega"
+        else None,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vega_model_runtime",
+        SimpleNamespace(
+            predict_deal=lambda _payload, _conn: manual_prediction(
+                "vega", 900, 12.0, "good"
+            )
+        ),
+    )
+
+    def fail_core(*_args):
+        raise RuntimeError("core unavailable")
+
+    for runtime in (price_model_runtime, igor_model_runtime, neural_model_runtime):
+        monkeypatch.setattr(runtime, "predict_deal", fail_core)
+
+    result = dashboard_server.build_predict_deal_payload(
+        {"name": "AK-47 | Slate (Field-Tested)", "buy_price_cents": 1_000}
+    )
+
+    assert "core prediction unavailable" in result["error"]
+    assert set(result["models"]) == {"vega"}
+    assert set(result["model_errors"]) == {"almaz", "igor", "nova"}
+    assert "selected_model" not in result
+
+
 def test_manual_comparison_routes_gloves_only_to_dedicated_model(monkeypatch):
     import glove_model_runtime
     import igor_model_runtime
@@ -438,6 +542,24 @@ def test_manual_comparison_keeps_working_model_results_and_surfaces_dissent(
         "predict_deal",
         lambda _payload, _conn: manual_prediction("nova", 900, -14, "bad"),
     )
+    # Pin the advisory Vega opinion to "active but failing on this empty
+    # database" so the result does not depend on whether trained Vega weights
+    # exist on the machine running the test (they are not in the repository).
+    import vega_model_runtime
+
+    real_pointer = dashboard_server.model_generations.read_active_pointer
+    monkeypatch.setattr(
+        dashboard_server.model_generations,
+        "read_active_pointer",
+        lambda model, **kwargs: (
+            {"generation_id": "test-vega"} if model == "vega" else real_pointer(model, **kwargs)
+        ),
+    )
+
+    def fail_vega(_payload, _conn):
+        raise sqlite3.OperationalError("no such table: sales")
+
+    monkeypatch.setattr(vega_model_runtime, "predict_deal", fail_vega)
 
     result = dashboard_server.build_predict_deal_payload(
         {"name": "AK-47 | Slate (Field-Tested)", "buy_price_cents": 1000}
@@ -446,8 +568,11 @@ def test_manual_comparison_keeps_working_model_results_and_surfaces_dissent(
     assert result["selected_model"] == "nova"
     assert result["comparison"]["confidence"] == "disagreement"
     assert result["comparison"]["dissenting_models"] == ["nova"]
-    assert result["comparison"]["unavailable_models"] == ["igor"]
-    assert result["model_errors"] == {"igor": "RuntimeError"}
+    assert result["comparison"]["unavailable_models"] == ["igor", "vega"]
+    assert result["model_errors"] == {
+        "igor": "RuntimeError",
+        "vega": "OperationalError",
+    }
     assert set(result["models"]) == {"almaz", "nova"}
 
 
@@ -523,6 +648,39 @@ def test_best_model_uses_roi_then_profit_and_tracks_nova(monkeypatch):
     assert result["summary"]["nova"] == 1
     assert result["summary"]["all_three"] == 1
     assert result["rows"][0]["confidence"] == "unanimous_three"
+
+
+def test_stored_vega_opinion_is_visible_but_never_changes_core_consensus(
+    monkeypatch,
+):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    deal_scanner.init_db(conn)
+    prediction_row(conn, "almaz", 10, 100)
+    prediction_row(conn, "igor", 9, 90)
+    prediction_row(conn, "nova", 8, 80)
+    prediction_row(conn, "vega", 100, 10_000)
+    monkeypatch.setattr(
+        dashboard_server, "add_deal_visual_fallbacks", lambda _conn, _rows: None
+    )
+
+    result = dashboard_server.fetch_model_deal_comparison_page(
+        conn=conn,
+        offset=0,
+        limit=10,
+        search="",
+        category="all",
+        seen_hours=0,
+    )
+    row = result["rows"][0]
+
+    assert set(row["models"]) == {"almaz", "igor", "nova", "vega"}
+    assert row["best"]["model_name"] == "almaz"
+    assert row["category"] == "all_three"
+    assert row["confidence"] == "unanimous_three"
+    assert row["advisory_models"] == ["vega"]
+    assert row["positive_advisory_models"] == ["vega"]
+    assert row["conservative_roi_percent"] == 8
 
 
 def test_comparison_keeps_dissenting_models_visible(monkeypatch):
@@ -891,6 +1049,7 @@ def test_model_freshness_keeps_knife_rows_out_of_weapon_models(tmp_path):
     assert by_name["almaz"]["current_rows"] == 2
     assert by_name["igor"]["current_rows"] == 2
     assert by_name["nova"]["current_rows"] == 2
+    assert by_name["vega"]["current_rows"] == 2
     assert by_name["knives"]["current_rows"] == 2
     assert by_name["knives"]["item_kind"] == "knife"
 

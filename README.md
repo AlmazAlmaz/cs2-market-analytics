@@ -2,50 +2,95 @@
 
 [![CI](https://github.com/AlmazAlmaz/cs2-market-analytics/actions/workflows/ci.yml/badge.svg)](https://github.com/AlmazAlmaz/cs2-market-analytics/actions/workflows/ci.yml)
 
-Production-oriented система аналитики рынка CS2: она собирает историю продаж
-CSFloat в SQLite, ищет активные сделки, оценивает их тремя независимыми ML-моделями,
-показывает результаты в web-интерфейсе и при необходимости отправляет их в
-Telegram.
+Production-oriented система аналитики рынка скинов CS2. Она непрерывно собирает
+историю продаж CSFloat в SQLite (≈3,2 млн продаж, база ≈20 ГБ), ищет активные
+выгодные лоты, оценивает их несколькими независимыми ML-моделями, показывает
+результат в двуязычном web-интерфейсе и при необходимости отправляет сделки в
+Telegram. Система с августа 2026 года работает на домашнем компьютере и
+публикуется наружу через reverse SSH-туннель до VPS с nginx.
 
-Репозиторий показывает полный исходный код, тесты и воспроизводимые отчёты о
-моделях. Рабочая база, API-ключи, пользовательские данные и обученные веса
-намеренно исключены из Git.
+*Production-style CS2 skin market analytics: continuous ingestion into a
+multi-GB SQLite store, ML price models with quality-gated rollout, a deal
+scanner, a bilingual web dashboard with accounts, and a Telegram bot.*
+
+Репозиторий содержит весь исходный код, тесты и отчёты о моделях. Рабочая база,
+API-ключи, пользовательские данные и обученные веса намеренно исключены из Git.
+
+![Проверка лота: сравнение моделей](docs/screenshots/check-listing.jpg)
 
 ## Что здесь реализовано
 
-- адаптивный parser с cursor pagination, дедупликацией, карантином повреждённых
-  записей, атомарным статусом и single-instance lock;
-- три независимых price-модели: gradient boosting Almaz и Igor, residual neural
-  network Nova с квантилями q15/q50/q85;
-- хронологические train/validation/test split и отдельный quality gate перед
-  атомарной активацией новой версии модели;
-- scanner активных лотов с консервативным consensus, ROI, liquidity и freshness;
-- двуязычный dashboard, аккаунты, inventory, рыночные тренды и read-only export API;
-- защита секретов, HttpOnly/SameSite cookies, default-deny Telegram access и
-  безопасная работа с SQLite snapshots.
+**Сбор данных и хранение**
+- адаптивный parser: планирование запросов по фактической скорости продаж,
+  cursor pagination, дедупликация, карантин повреждённых записей, атомарный
+  статус и single-instance lock;
+- SQLite в режиме WAL: фоновые процессы пишут, сайт читает без блокировок;
+  тяжёлые запросы сайта идут по индексам или из заранее посчитанных
+  агрегатов, а не полным сканированием многогигабайтной таблицы;
+- отдельная derived-база трендов, которую фоновый worker атомарно пересобирает
+  раз в 6 часов.
+
+**Backend и API**
+- HTTP-сервер на стандартной библиотеке Python (`ThreadingHTTPServer`): HTML-страницы,
+  JSON API, аккаунты с ролями, CSRF-защита, HttpOnly/SameSite cookies, CSP;
+- stale-while-revalidate кэш для тяжёлых агрегатов: ответ страницы
+  администратора сократился с ~35 с до ~0,2 с; gzip-сжатие уменьшает
+  трафик страниц примерно в 5 раз;
+- отдельный read-only API экспорта продаж с токен-авторизацией;
+- Telegram-бот с default-deny доступом по chat ID и атомарным хранением offset.
+
+**ML и MLOps**
+- три независимые модели цены (gradient boosting Almaz и Igor, residual neural
+  network Nova с квантилями q15/q50/q85) и советующая модель Vega;
+  отдельные контуры для ножей и перчаток;
+- хронологические train/validation/test split, quality gate на общем holdout и
+  атомарное переключение на новую версию без перезапуска сервисов, с откатом
+  на предыдущую проверенную версию;
+- прогноз трендов 7/14/30 дней с затуханием импульса и walk-forward бэктест с
+  учётом комиссии, проскальзывания и вероятности исполнения.
+
+**Эксплуатация**
+- один супервизор запускает и корректно останавливает parser, scanner,
+  dashboard, trend worker и туннель на macOS (`start_all.sh`) и Windows
+  (`start_all.ps1`, окно управления на C#);
+- CI на GitHub Actions: ruff и 1000+ тестов на каждый push.
 
 ## Архитектура
 
 ```mermaid
 flowchart LR
     API[CSFloat API] --> Parser[Adaptive parser]
-    Parser --> DB[(SQLite history)]
+    Parser --> DB[(SQLite history, WAL)]
+    DB --> Trend[Trend worker]
+    Trend --> TDB[(Trend store)]
     DB --> Training[Time-aware training]
-    Training --> Models[Versioned model bundles]
+    Training --> Gate{Quality gate}
+    Gate --> Models[Versioned model bundles]
     API --> Scanner[Deal scanner]
     Models --> Scanner
-    DB --> Dashboard[Dashboard and read-only API]
-    Scanner --> Dashboard
-    Dashboard --> Web[Web UI]
+    Scanner --> DB
+    DB --> Dashboard[Dashboard + JSON API]
+    TDB --> Dashboard
+    Models --> Dashboard
+    Dashboard --> Nginx[nginx on VPS via reverse SSH]
     Scanner --> Telegram[Telegram bot]
 ```
 
 Основные entry points: `parser_final.py`, `dashboard_server.py`, `deal_scanner.py`,
-`trend_worker.py`, `model_training_jobs.py` и `start_all.sh`. Модельные runtime
-находятся в `price_model_runtime.py`, `igor_model_runtime.py` и
-`neural_model_runtime.py`.
+`trend_worker.py`, `model_training_jobs.py`, `start_all.sh` / `start_all.ps1`.
+Runtime моделей: `price_model_runtime.py`, `igor_model_runtime.py`,
+`neural_model_runtime.py`, `vega_model_runtime.py`, `knife_model_runtime.py`,
+`glove_model_runtime.py`. Общий визуальный слой страниц — `web_theme.py`.
 
-## Проверенные результаты
+## Скриншоты
+
+| Стратегия и тренды | Рынок (светлая тема) |
+|---|---|
+| ![Стратегия](docs/screenshots/strategy.jpg) | ![Рынок](docs/screenshots/market-light.jpg) |
+| **Ножи** | **Система: сканер и модели** |
+| ![Ножи](docs/screenshots/knives.jpg) | ![Система](docs/screenshots/system.jpg) |
+
+## Проверенные результаты моделей
 
 | Модель | Chronological holdout | MAE | Median APE |
 |---|---:|---:|---:|
@@ -70,27 +115,23 @@ python3.12 -m venv .venv
 ./.venv/bin/ruff check --select E4,E7,E9,F --ignore E402,E731 .
 ```
 
-Текущий набор содержит 880 тестов. CI выполняет эти же проверки на Python 3.12.
+Набор содержит 1 039 тестов. CI выполняет эти же проверки на Ubuntu и Python 3.12;
+тесты, которым нужны Windows, Node.js или локальные обученные веса, там
+пропускаются автоматически.
 
 ## Полный локальный запуск
 
-`setup_mac.sh` создаёт окружение и приватные шаблоны конфигурации:
-
-```bash
-./setup_mac.sh
-```
-
 Полная система требует локальную историю SQLite и обученные model bundles. Эти
-файлы велики, зависят от приватных данных и не публикуются. На уже подготовленной
-машине все процессы запускаются одной командой:
+файлы велики, зависят от приватных данных и не публикуются.
 
-```bash
-./start_all.sh
-```
+- macOS: `./setup_mac.sh`, затем `./start_all.sh` — подробности в
+  [README_MAC.md](README_MAC.md);
+- Windows: `setup_windows.cmd`, затем `start_all.cmd` или ярлык CS2 Dashboard —
+  подробности, CUDA и управление автозапуском в [README_WINDOWS.md](README_WINDOWS.md).
 
-Команда запускает dashboard, parser, scanner, Trend worker и настроенный reverse
-SSH до VPS, проверяет локальный и публичный `/health` и корректно завершает
-дочерние процессы по `Ctrl+C`. Необязательные Telegram и export API включаются
+Супервизор запускает dashboard, parser, scanner, trend worker и настроенный
+reverse SSH до VPS, проверяет локальный и публичный `/health` и корректно
+завершает дочерние процессы. Необязательные Telegram и export API включаются
 только при заполненной конфигурации.
 
 ## Основные разделы сайта
@@ -359,6 +400,15 @@ CS2_ACCOUNT_SMTP_STARTTLS=true
 Если владелец регистрируется в браузере, где уже установлена admin-cookie от
 `DASHBOARD_TOKEN`, аккаунт создаётся с ролью `admin`.
 
+На локальной странице **Пользователи** (`/admin/users`) у каждого аккаунта
+показаны скачивания базы через `/download/db`: подготовка, текущий объём и
+процент передачи, завершение или обрыв, общий объём и последние скачивания.
+Данные обновляются каждые 2 секунды, пока вкладка открыта. Скачивания по общему
+ключу без входа в аккаунт видны отдельно, с IP-адресом. История хранится в базе
+аккаунтов и сохраняется после перезапуска; учёт начинается после установки
+обновления. Объём означает байты, переданные сервером, и не подтверждает
+сохранение файла на устройстве пользователя.
+
 ## Конфигурация и секреты
 
 - `config.local.env` — локальные пути, токены приложения и настройки Telegram;
@@ -419,6 +469,7 @@ hashes, ограничения и точный rollback: [IGOR_UPDATE_REPORT.md]
 - [Отчёт переобучения Almaz v3](MODEL_UPDATE_REPORT.md)
 - [Отчёт переобучения Igor v2](IGOR_UPDATE_REPORT.md)
 - [Архитектура и безопасное обучение Igor](IGORMODEL/README.md)
+- [Установка, запуск и CUDA на Windows](README_WINDOWS.md)
 - [Установка и запуск на macOS](README_MAC.md)
 - [Публикация через существующий VPS и reverse SSH](reverse_ssh_setup.md)
 - [Архитектура и обучение Nova](NEURALMODEL/README.md)

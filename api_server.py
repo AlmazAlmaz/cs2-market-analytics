@@ -183,7 +183,7 @@ def main():
 
     print(f"API running on http://{HOST}:{PORT}")
     print("Endpoint:")
-    print(f"curl -H 'X-API-Token: <redacted>' 'http://{HOST}:{PORT}/sales?limit=1000'")
+    print(f"curl -H 'X-API-Token: YOUR_TOKEN' 'http://{HOST}:{PORT}/sales?limit=1000'")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

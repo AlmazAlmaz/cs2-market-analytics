@@ -33,7 +33,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +41,8 @@ from typing import Any
 
 import app_config
 import model_generations
+import portable_os
+import windows_service_control
 from item_classification import (
     ITEM_KIND_GLOVE,
     ITEM_KIND_KNIFE,
@@ -52,14 +54,15 @@ from price_model_data_contract import time_safe_reference_sql
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - production is macOS/Linux
-    fcntl = None
+except ImportError:  # Windows
+    import portable_fcntl as fcntl
 
 
 SCHEMA_VERSION = 1
-MODEL_NAMES = ("almaz", "igor", "nova", "knives", "gloves")
+MODEL_NAMES = ("almaz", "igor", "nova", "vega", "knives", "gloves")
 LEGACY_SCHEMA_V1_MODEL_NAMES = ("almaz", "igor", "nova")
 PRE_GLOVE_SCHEMA_V1_MODEL_NAMES = ("almaz", "igor", "nova", "knives")
+PRE_VEGA_SCHEMA_V1_MODEL_NAMES = ("almaz", "igor", "nova", "knives", "gloves")
 LEGACY_ALMAZ_SHA_ERROR = (
     "candidate quality gate rejected almaz: "
     "Almaz production metrics do not identify the model SHA-256"
@@ -92,10 +95,14 @@ GLOVE_RETRAIN_MIN_NEW_ROWS = KNIFE_RETRAIN_MIN_NEW_ROWS
 GLOVE_BOOTSTRAP_MIN_RUNTIME_VALID_ROWS = KNIFE_BOOTSTRAP_MIN_RUNTIME_VALID_ROWS
 GLOVE_RETRAIN_MIN_RUNTIME_VALID_ROWS = KNIFE_RETRAIN_MIN_RUNTIME_VALID_ROWS
 RESERVED_TEST_ROWS = 5_000
+VEGA_RESERVED_TEST_ROWS = 25_000
+VEGA_BOOTSTRAP_MIN_ROWS = 100_000
+VEGA_BOOTSTRAP_MIN_RUNTIME_VALID_ROWS = 100_000
 MODEL_ESTIMATED_TOTAL_SECONDS = {
     "almaz": 2_400,
     "igor": 4_200,
     "nova": 2_700,
+    "vega": 3_600,
     "knives": 2_400,
     "gloves": 2_400,
 }
@@ -103,6 +110,7 @@ MODEL_MIN_FREE_DISK_BYTES = {
     "almaz": 6 * 1024**3,
     "igor": 12 * 1024**3,
     "nova": 7 * 1024**3,
+    "vega": 12 * 1024**3,
     "knives": 6 * 1024**3,
     "gloves": 6 * 1024**3,
 }
@@ -143,7 +151,7 @@ def _model_item_kind(model: str) -> str:
         return ITEM_KIND_KNIFE
     if model == "gloves":
         return ITEM_KIND_GLOVE
-    if model in {"almaz", "igor", "nova"}:
+    if model in {"almaz", "igor", "nova", "vega"}:
         return ITEM_KIND_WEAPON_SKIN
     raise ValueError(f"unknown model: {model!r}")
 
@@ -287,21 +295,14 @@ def _secure_open(path: Path, flags: int, mode: int = 0o600) -> int:
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags, mode)
-        os.fchmod(descriptor, mode)
+        portable_os.fchmod(descriptor, mode)
         return descriptor
     except OSError as exc:
         raise TrainingJobError(f"cannot securely open {path}") from exc
 
 
 def _fsync_directory(path: Path) -> None:
-    try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    portable_os.fsync_directory(path)
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -416,9 +417,9 @@ def _validate_state(
 def _migrate_state(payload: Any) -> tuple[dict[str, Any], bool]:
     """Upgrade an exact legacy schema-v1 model set without losing job history.
 
-    Schema v1 originally persisted only Almaz, Igor, and Nova; Knives and then
-    Gloves were added without otherwise changing the state format.  A narrowly
-    scoped in-version migration is safer than resetting terminal job records.
+    Schema v1 originally persisted only Almaz, Igor, and Nova; Knives, Gloves,
+    and then Vega were added without otherwise changing the state format.  A
+    narrowly scoped in-version migration is safer than resetting terminal job records.
     Unknown, partial, or future model sets remain fail-closed and are never
     rewritten.
     """
@@ -428,6 +429,7 @@ def _migrate_state(payload: Any) -> tuple[dict[str, Any], bool]:
     legacy_model_sets = (
         set(LEGACY_SCHEMA_V1_MODEL_NAMES),
         set(PRE_GLOVE_SCHEMA_V1_MODEL_NAMES),
+        set(PRE_VEGA_SCHEMA_V1_MODEL_NAMES),
     )
     if (
         isinstance(payload, dict)
@@ -590,7 +592,7 @@ def _model_spec(
     python = Path(
         python_bin
         or app_config.get("CS2_TRAINING_PYTHON")
-        or paths.project / ".venv" / "bin" / "python"
+        or portable_os.venv_python(paths.project)
     ).expanduser()
     if not python.is_absolute():
         python = paths.project / python
@@ -677,7 +679,7 @@ def _model_spec(
             "igor_metrics.json",
         )
         metrics = "igor_metrics.json"
-    else:
+    elif model == "nova":
         staging_root = paths.project / "NEURALMODEL" / "staging"
         candidate = staging_root / "training_jobs" / job_id
         trainer_source = (paths.project / "train_neural_model.py").read_text(
@@ -701,6 +703,22 @@ def _model_spec(
         )
         required = ("nova_price_model.pt", "nova_metadata.json", "nova_metrics.json")
         metrics = "nova_metrics.json"
+    else:
+        staging_root = paths.project / "VEGAMODEL" / "staging"
+        candidate = staging_root / "training_jobs" / job_id
+        command = (
+            str(python),
+            str(paths.project / "train_vega_model.py"),
+            "--artifact-dir",
+            str(candidate),
+            "--rebuild-cache",
+            "--epochs",
+            "20",
+            "--test-rows",
+            str(VEGA_RESERVED_TEST_ROWS),
+        )
+        required = ("vega_price_model.pt", "vega_metadata.json", "vega_metrics.json")
+        metrics = "vega_metrics.json"
 
     _assert_no_symlink_components(candidate, paths.project)
     candidate = candidate.resolve(strict=False)
@@ -712,6 +730,7 @@ def _model_spec(
         (paths.project / "models").resolve(),
         (paths.project / "IGORMODEL" / "artifacts").resolve(),
         (paths.project / "NEURALMODEL" / "artifacts").resolve(),
+        (paths.project / "VEGAMODEL" / "artifacts").resolve(),
         (paths.project / "KNIFEMODEL" / "artifacts").resolve(),
         (paths.project / "GLOVEMODEL" / "artifacts").resolve(),
     }
@@ -977,6 +996,7 @@ def _production_metrics(model: str, paths: JobPaths) -> tuple[Path, dict[str, An
         "almaz": paths.project / "models",
         "igor": paths.project / "IGORMODEL" / "artifacts",
         "nova": paths.project / "NEURALMODEL" / "artifacts",
+        "vega": paths.project / "VEGAMODEL" / "artifacts",
         "knives": paths.project / "KNIFEMODEL" / "artifacts",
         "gloves": paths.project / "GLOVEMODEL" / "artifacts",
     }
@@ -984,6 +1004,7 @@ def _production_metrics(model: str, paths: JobPaths) -> tuple[Path, dict[str, An
         "almaz": "csfloat_price_model_metrics.json",
         "igor": "igor_metrics.json",
         "nova": "nova_metrics.json",
+        "vega": "vega_metrics.json",
         "knives": "knife_price_model_metrics.json",
         "gloves": "glove_price_model_metrics.json",
     }
@@ -1161,37 +1182,35 @@ def get_model_training_eligibility(
     threshold_trained_rows = None if contract_migration else trained_rows
     threshold_boundary_dt = None if contract_migration else boundary_dt
     isolated_model = model in {"knives", "gloves"}
-    bootstrap = isolated_model and not metrics
-    min_new_rows = (
-        (
+    bootstrap = model in {"knives", "gloves", "vega"} and not metrics
+    if model == "vega" and bootstrap:
+        min_new_rows = VEGA_BOOTSTRAP_MIN_ROWS
+        min_runtime_valid_rows = VEGA_BOOTSTRAP_MIN_RUNTIME_VALID_ROWS
+    elif bootstrap:
+        min_new_rows = (
             KNIFE_BOOTSTRAP_MIN_ROWS
             if model == "knives"
             else GLOVE_BOOTSTRAP_MIN_ROWS
         )
-        if bootstrap
-        else (
-            KNIFE_RETRAIN_MIN_NEW_ROWS
-            if model == "knives"
-            else GLOVE_RETRAIN_MIN_NEW_ROWS
-        )
-        if isolated_model
-        else MIN_NEW_ROWS
-    )
-    min_runtime_valid_rows = (
-        (
+        min_runtime_valid_rows = (
             KNIFE_BOOTSTRAP_MIN_RUNTIME_VALID_ROWS
             if model == "knives"
             else GLOVE_BOOTSTRAP_MIN_RUNTIME_VALID_ROWS
         )
-        if bootstrap
-        else (
+    elif isolated_model:
+        min_new_rows = (
+            KNIFE_RETRAIN_MIN_NEW_ROWS
+            if model == "knives"
+            else GLOVE_RETRAIN_MIN_NEW_ROWS
+        )
+        min_runtime_valid_rows = (
             KNIFE_RETRAIN_MIN_RUNTIME_VALID_ROWS
             if model == "knives"
             else GLOVE_RETRAIN_MIN_RUNTIME_VALID_ROWS
         )
-        if isolated_model
-        else MIN_RUNTIME_VALID_NEW_ROWS
-    )
+    else:
+        min_new_rows = MIN_NEW_ROWS
+        min_runtime_valid_rows = MIN_RUNTIME_VALID_NEW_ROWS
     provenance_reasons = _production_provenance_reasons(model, metrics, source)
     reasons: list[str] = list(provenance_reasons)
     if not metrics and not bootstrap:
@@ -1205,6 +1224,7 @@ def get_model_training_eligibility(
         "almaz": paths.project / "train_price_model.py",
         "igor": paths.project / "IGORMODEL" / "train.py",
         "nova": paths.project / "train_neural_model.py",
+        "vega": paths.project / "train_vega_model.py",
         "knives": paths.project / "train_knife_price_model.py",
         "gloves": paths.project / "train_glove_price_model.py",
     }[model]
@@ -1538,9 +1558,12 @@ def _create_database_snapshot(
 
     try:
         source_uri = f"{source_path.resolve().as_uri()}?mode=ro"
-        with sqlite3.connect(source_uri, uri=True, timeout=30) as source:
+        # sqlite3.Connection's context manager commits or rolls back, but does
+        # not close the handle.  Windows refuses the atomic rename while the
+        # temporary database is still open, so close both handles explicitly.
+        with closing(sqlite3.connect(source_uri, uri=True, timeout=30)) as source:
             source.execute("PRAGMA query_only=ON")
-            with sqlite3.connect(temporary, timeout=30) as target:
+            with closing(sqlite3.connect(temporary, timeout=30)) as target:
                 source.backup(target, pages=16_384, progress=progress, sleep=0.05)
                 check = target.execute("PRAGMA quick_check").fetchone()
                 if not check or check[0] != "ok":
@@ -1553,6 +1576,7 @@ def _create_database_snapshot(
                         """
                     ).fetchone()[0]
                 )
+                target.commit()
         os.chmod(temporary, 0o400)
         os.replace(temporary, destination)
         _fsync_directory(paths.snapshot_dir)
@@ -1594,6 +1618,7 @@ def _candidate_roots(paths: JobPaths) -> dict[str, Path]:
         "almaz": paths.project / "models" / "staging" / "training_jobs",
         "igor": paths.project / "IGORMODEL" / "staging" / "training_jobs",
         "nova": paths.project / "NEURALMODEL" / "staging" / "training_jobs",
+        "vega": paths.project / "VEGAMODEL" / "staging" / "training_jobs",
         "knives": paths.project / "KNIFEMODEL" / "staging" / "training_jobs",
         "gloves": paths.project / "GLOVEMODEL" / "staging" / "training_jobs",
     }
@@ -1605,12 +1630,12 @@ def _remove_candidate_tree(path: Path, root: Path) -> None:
     for directory, names, filenames in os.walk(path, topdown=True, followlinks=False):
         directory_path = Path(directory)
         info = directory_path.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        if not stat.S_ISDIR(info.st_mode) or not portable_os.owned_by_current_user(info):
             raise TrainingJobError(f"unsafe directory in candidate cleanup: {directory_path}")
         for name in [*names, *filenames]:
             child = directory_path / name
             child_info = child.lstat()
-            if stat.S_ISLNK(child_info.st_mode) or child_info.st_uid != os.getuid():
+            if stat.S_ISLNK(child_info.st_mode) or not portable_os.owned_by_current_user(child_info):
                 raise TrainingJobError(f"unsafe entry in candidate cleanup: {child}")
     for directory, _names, filenames in os.walk(path, topdown=False):
         directory_path = Path(directory)
@@ -1662,7 +1687,10 @@ def cleanup_training_candidates(
         root_info = root.lstat()
         if root.is_symlink() or not root.is_dir():
             raise TrainingJobError(f"candidate retention root is unsafe: {root}")
-        if root_info.st_uid != os.getuid() or stat.S_IMODE(root_info.st_mode) & 0o022:
+        if (
+            not portable_os.owned_by_current_user(root_info)
+            or portable_os.has_unsafe_group_or_world_write(root_info)
+        ):
             raise TrainingJobError(f"candidate retention root is not private: {root}")
         for entry in sorted(root.iterdir(), key=lambda value: value.name):
             if not _JOB_ID_RE.fullmatch(entry.name) or entry.name in keep[model]:
@@ -1701,7 +1729,7 @@ class ProgressTracker:
         self.phase = "preparing"
         self.explicit_eta: float | None = None
         self.igor_component = "point"
-        self.nova_epochs = 18
+        self.neural_epochs = {"nova": 18, "vega": 20}.get(model)
 
     def eta_seconds(self) -> int:
         elapsed = max(time.monotonic() - self.started, 0.0)
@@ -1781,7 +1809,7 @@ class ProgressTracker:
                         if phase_eta is not None
                         else None
                     )
-        else:
+        elif self.model in {"nova", "vega"}:
             if "data_loading:" in lower:
                 phase, percent = "building_cache", 7
             elif lower.startswith("features:"):
@@ -1807,7 +1835,8 @@ class ProgressTracker:
                 if match:
                     epoch = int(match.group(1))
                     phase = "training_epochs"
-                    percent = 29 + 60 * min(epoch, self.nova_epochs) / self.nova_epochs
+                    total_epochs = int(self.neural_epochs or 1)
+                    percent = 29 + 60 * min(epoch, total_epochs) / total_epochs
 
         self.phase = phase
         self.percent = min(99.0, max(self.percent, float(percent)))
@@ -1841,20 +1870,34 @@ def _read_log_tail(paths: JobPaths, model: str, job_id: str) -> list[str]:
 
 
 def _process_alive(pid: Any) -> bool:
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+    return portable_os.process_alive(pid)
 
 
 def _process_command(pid: int) -> str | None:
+    if portable_os.IS_WINDOWS:
+        command_text = (
+            "$p = Get-CimInstance Win32_Process -Filter 'ProcessId = "
+            + str(int(pid))
+            + "'; if ($null -ne $p) { $p.CommandLine }"
+        )
+        try:
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    command_text,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        command = result.stdout.strip()
+        return command if result.returncode == 0 and command else None
     try:
         result = subprocess.run(
             ["ps", "-p", str(pid), "-o", "command="],
@@ -1871,6 +1914,53 @@ def _process_command(pid: int) -> str | None:
 
 def _process_start_token(pid: int) -> str | None:
     """Return an OS process-birth token to defend cancellation from PID reuse."""
+
+    if portable_os.IS_WINDOWS:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [
+                wintypes.DWORD,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            ]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetProcessTimes.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+            ]
+            kernel32.GetProcessTimes.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            process = kernel32.OpenProcess(0x1000, False, int(pid))
+            if not process:
+                return None
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            try:
+                if not kernel32.GetProcessTimes(
+                    process,
+                    ctypes.byref(creation),
+                    ctypes.byref(exit_time),
+                    ctypes.byref(kernel),
+                    ctypes.byref(user),
+                ):
+                    return None
+            finally:
+                kernel32.CloseHandle(process)
+            value = (int(creation.dwHighDateTime) << 32) | int(
+                creation.dwLowDateTime
+            )
+            return f"win:{value}"
+        except (OSError, ValueError, TypeError):
+            return None
 
     proc_stat = Path("/proc") / str(pid) / "stat"
     try:
@@ -1900,6 +1990,7 @@ def _pid_matches(job: dict[str, Any], kind: str) -> bool:
     command = _process_command(pid)
     if command is None:
         return False
+    command = command.replace("\\", "/")
     expected_start = job.get(f"{kind}_start_token")
     if not expected_start or _process_start_token(pid) != expected_start:
         return False
@@ -2263,6 +2354,8 @@ def start_model_training(
 ) -> dict[str, Any]:
     """Start one whitelisted staging trainer and return its public job state."""
 
+    if windows_service_control.stop_requested():
+        raise TrainingJobError("application shutdown is in progress")
     paths = _paths(project_dir)
     eligibility = get_model_training_eligibility(model, project_dir=paths.project)
     if not eligibility["eligible"]:
@@ -2286,6 +2379,7 @@ def start_model_training(
     _secure_directory(paths.log_dir, paths.project)
     resource_fd = _acquire_resource_lock(paths)
     worker: subprocess.Popen[Any] | None = None
+    worker_log: Any | None = None
     try:
         def prepare(state: dict[str, Any]) -> None:
             _recover_state_unlocked(state, paths)
@@ -2303,24 +2397,38 @@ def start_model_training(
             "--worker",
             model,
             job_id,
-            str(resource_fd),
+            str(-1 if portable_os.IS_WINDOWS else resource_fd),
             str(paths.project),
         ]
         environment = dict(os.environ)
         environment["PYTHONUNBUFFERED"] = "1"
         environment["CS2_TRAINING_INTERNAL_WORKER"] = "1"
-        worker = subprocess.Popen(
-            worker_command,
-            cwd=str(paths.project),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            shell=False,
-            close_fds=True,
-            pass_fds=(resource_fd,),
-            start_new_session=True,
-            env=environment,
+        worker_log_fd = _secure_open(
+            _log_path(paths, model, job_id),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
         )
+        worker_log = os.fdopen(
+            worker_log_fd,
+            "w",
+            encoding="utf-8",
+            buffering=1,
+        )
+        worker_options: dict[str, Any] = {
+            "cwd": str(paths.project),
+            "stdin": subprocess.DEVNULL,
+            "stdout": worker_log,
+            "stderr": subprocess.STDOUT,
+            "shell": False,
+            "close_fds": True,
+            "env": environment,
+        }
+        if portable_os.IS_WINDOWS:
+            worker_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            worker_options["pass_fds"] = (resource_fd,)
+            worker_options["start_new_session"] = True
+        worker = subprocess.Popen(worker_command, **worker_options)
+        windows_service_control.register_child(worker)
 
         def record_worker(state: dict[str, Any]) -> None:
             job = state["models"][model]
@@ -2360,8 +2468,10 @@ def start_model_training(
             pass
         raise
     finally:
-        # The worker inherited this locked open-file description.  Closing the
-        # dashboard copy does not release the lock while worker/trainer lives.
+        if worker_log is not None:
+            worker_log.close()
+        # POSIX workers inherit this locked open-file description.  A Windows
+        # worker takes ownership itself immediately after its PID is recorded.
         _release_resource_lock(resource_fd)
     return get_model_training_status(model, project_dir=paths.project)
 
@@ -2421,9 +2531,12 @@ def cancel_model_training(
             "cancellation was recorded but its pending activation could not be cleared"
         ) from exc
     try:
-        if kind == "pending":
+        if kind == "pending" or (portable_os.IS_WINDOWS and kind == "worker"):
+            # A pending start has no process yet.  A Windows worker polls the
+            # persisted flag; SIGTERM is an unconditional TerminateProcess
+            # and could orphan its GPU trainer before it can reap that child.
             pass
-        elif kind == "worker":
+        elif portable_os.IS_WINDOWS or kind == "worker":
             os.kill(pid, signal.SIGTERM)
         else:
             os.killpg(pid, signal.SIGTERM)
@@ -2473,6 +2586,10 @@ def _validate_candidate(spec: ModelSpec, started_at: str) -> dict[str, Any]:
     try:
         if spec.name == "igor":
             from IGORMODEL.promote_candidate import validate_candidate
+
+            manifest = validate_candidate(spec.candidate_dir)
+        elif spec.name == "vega":
+            from VEGAMODEL.promote_candidate import validate_candidate
 
             manifest = validate_candidate(spec.candidate_dir)
         else:
@@ -2531,15 +2648,80 @@ def _update_worker_job(
 
 
 def _job_cancel_requested(paths: JobPaths, model: str, job_id: str) -> bool:
+    if windows_service_control.stop_requested():
+        return True
     with _locked_state(paths):
         state = _read_state_unlocked(paths)
     job = state["models"][model]
     return job.get("job_id") != job_id or bool(job.get("cancel_requested"))
 
 
+def _claim_worker_identity(paths: JobPaths, model: str, job_id: str) -> bool:
+    """Persist the PID of the interpreter that is actually running the worker.
+
+    A Windows virtual-environment ``python.exe`` is a launcher which starts the
+    base interpreter and waits for it.  ``Popen.pid`` therefore identifies the
+    launcher while ``os.getpid()`` inside this worker identifies its child.
+    Accept that one verified parent-to-child handoff and replace the temporary
+    launcher identity atomically.  Native/POSIX interpreters keep the original
+    exact-PID behaviour.
+    """
+
+    actual_pid = os.getpid()
+    actual_token = _process_start_token(actual_pid)
+    if not actual_token:
+        raise TrainingJobError("cannot record actual worker process birth token")
+    launcher_pid = os.getppid() if portable_os.IS_WINDOWS else None
+    launcher_token = (
+        _process_start_token(launcher_pid)
+        if launcher_pid is not None and launcher_pid > 0
+        else None
+    )
+    claimed = False
+
+    def claim(state: dict[str, Any]) -> None:
+        nonlocal claimed
+        job = state["models"][model]
+        if (
+            state.get("active_job_id") != job_id
+            or job.get("job_id") != job_id
+            or job.get("state") not in ACTIVE_STATES
+        ):
+            raise TrainingJobError("worker job is no longer active")
+        recorded_pid = job.get("worker_pid")
+        recorded_token = job.get("worker_start_token")
+        if recorded_pid is None:
+            return
+        if recorded_pid == actual_pid:
+            if recorded_token != actual_token:
+                raise TrainingJobError("persisted worker birth token does not match")
+            claimed = True
+            return
+        if (
+            portable_os.IS_WINDOWS
+            and recorded_pid == launcher_pid
+            and launcher_token
+            and recorded_token == launcher_token
+        ):
+            job["worker_pid"] = actual_pid
+            job["worker_start_token"] = actual_token
+            job["updated_at"] = _utc_now()
+            claimed = True
+            return
+        raise TrainingJobError("persisted worker process identity does not match")
+
+    _mutate_state(paths, claim)
+    return claimed
+
+
 def _terminate_group(pid: int, *, force: bool = False) -> None:
     try:
-        os.killpg(pid, signal.SIGKILL if force else signal.SIGTERM)
+        if portable_os.IS_WINDOWS:
+            # Trainers do not create descendants on Windows.  SIGTERM maps to
+            # TerminateProcess and is therefore already the forceful fallback.
+            os.kill(pid, signal.SIGTERM)
+        else:
+            os.killpg(pid, signal.SIGKILL if force else signal.SIGTERM)
     except ProcessLookupError:
         return
 
@@ -2615,12 +2797,17 @@ def _run_worker(model: str, job_id: str, resource_fd: int, project_dir: Path) ->
         raise TrainingJobError("worker mode is internal")
     if model not in MODEL_NAMES or not _JOB_ID_RE.fullmatch(job_id):
         raise TrainingJobError("invalid worker job identity")
-    try:
-        os.fstat(resource_fd)
-    except OSError as exc:
-        raise TrainingJobError("worker did not inherit the global training lock") from exc
-
     paths = _paths(project_dir)
+    if portable_os.IS_WINDOWS:
+        if resource_fd != -1:
+            raise TrainingJobError("Windows worker received an unsafe inherited lock")
+    else:
+        try:
+            os.fstat(resource_fd)
+        except OSError as exc:
+            raise TrainingJobError(
+                "worker did not inherit the global training lock"
+            ) from exc
     log_path = _log_path(paths, model, job_id)
     cancel_signal = False
 
@@ -2630,25 +2817,44 @@ def _run_worker(model: str, job_id: str, resource_fd: int, project_dir: Path) ->
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
+    if portable_os.IS_WINDOWS and hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, on_signal)
 
     def cancellation_requested() -> bool:
         return cancel_signal or _job_cancel_requested(paths, model, job_id)
 
-    # Parent records our PID immediately after Popen.  Wait briefly instead of
-    # racing it and accidentally running an untracked trainer.
+    # Parent records Popen.pid immediately after launch.  On Windows that can
+    # be the venv launcher parent, so atomically replace it with our real PID.
+    # Wait briefly instead of racing the parent state write.
     claimed = False
     for _ in range(50):
-        with _locked_state(paths):
-            state = _read_state_unlocked(paths)
-        job = state["models"][model]
-        if job.get("job_id") != job_id:
-            raise TrainingJobError("worker job is no longer active")
-        if job.get("worker_pid") == os.getpid():
+        if _claim_worker_identity(paths, model, job_id):
             claimed = True
             break
         time.sleep(0.1)
     if not claimed:
         raise TrainingJobError("worker could not confirm its persisted PID")
+    with _locked_state(paths):
+        claimed_state = _read_state_unlocked(paths)
+    job = claimed_state["models"][model]
+    if job.get("job_id") != job_id or job.get("state") not in ACTIVE_STATES:
+        raise TrainingJobError("worker job is no longer active")
+
+    if portable_os.IS_WINDOWS:
+        # Windows byte-range locks are process-owned and cannot use POSIX
+        # ``pass_fds`` handoff semantics.  The dashboard keeps the lock until
+        # the PID claim above is durable; after it closes, take ownership here.
+        deadline = time.monotonic() + 10.0
+        while True:
+            try:
+                resource_fd = _acquire_resource_lock(paths)
+                break
+            except TrainingConflictError:
+                if time.monotonic() >= deadline:
+                    raise TrainingJobError(
+                        "Windows worker could not take the global training lock"
+                    )
+                time.sleep(0.05)
 
     trainer: subprocess.Popen[Any] | None = None
     tracker = ProgressTracker(model)
@@ -2676,38 +2882,53 @@ def _run_worker(model: str, job_id: str, resource_fd: int, project_dir: Path) ->
         )
         tracker.percent = max(tracker.percent, 5.0)
         spec = _model_spec(model, paths, Path(sys.executable), snapshot_path)
-        log_fd = _secure_open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        log_fd = _secure_open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
         with os.fdopen(log_fd, "w", encoding="utf-8", buffering=1) as log_writer:
             trainer_environment = {
                 **os.environ,
                 "PYTHONUNBUFFERED": "1",
                 "CS2_DB_PATH": str(snapshot_path),
             }
-            gate_read_fd, gate_write_fd = os.pipe()
-            gate_command = [
-                str(Path(sys.executable)),
-                str(Path(__file__).resolve()),
-                "--trainer-gate",
-                model,
-                job_id,
-                str(resource_fd),
-                str(paths.project),
-                str(gate_read_fd),
-            ]
-            trainer = subprocess.Popen(
-                gate_command,
-                cwd=str(paths.project),
-                stdin=subprocess.DEVNULL,
-                stdout=log_writer,
-                stderr=subprocess.STDOUT,
-                shell=False,
-                close_fds=True,
-                pass_fds=(resource_fd, gate_read_fd),
-                start_new_session=True,
-                env=trainer_environment,
-            )
-            os.close(gate_read_fd)
-            gate_read_fd = None
+            if portable_os.IS_WINDOWS:
+                # The worker owns the global lock for the trainer lifetime.
+                # A direct child avoids unsupported pass_fds/os.execve handoff.
+                trainer = subprocess.Popen(
+                    list(spec.command),
+                    cwd=str(paths.project),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_writer,
+                    stderr=subprocess.STDOUT,
+                    shell=False,
+                    close_fds=True,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                    env=trainer_environment,
+                )
+            else:
+                gate_read_fd, gate_write_fd = os.pipe()
+                gate_command = [
+                    str(Path(sys.executable)),
+                    str(Path(__file__).resolve()),
+                    "--trainer-gate",
+                    model,
+                    job_id,
+                    str(resource_fd),
+                    str(paths.project),
+                    str(gate_read_fd),
+                ]
+                trainer = subprocess.Popen(
+                    gate_command,
+                    cwd=str(paths.project),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_writer,
+                    stderr=subprocess.STDOUT,
+                    shell=False,
+                    close_fds=True,
+                    pass_fds=(resource_fd, gate_read_fd),
+                    start_new_session=True,
+                    env=trainer_environment,
+                )
+                os.close(gate_read_fd)
+                gate_read_fd = None
             trainer_start_token = _process_start_token(trainer.pid)
             if not trainer_start_token:
                 _terminate_group(trainer.pid)
@@ -2723,9 +2944,10 @@ def _run_worker(model: str, job_id: str, resource_fd: int, project_dir: Path) ->
                 heartbeat_at=_utc_now(),
             ):
                 raise TrainingJobError("trainer PID could not be persisted")
-            os.write(gate_write_fd, b"1")
-            os.close(gate_write_fd)
-            gate_write_fd = None
+            if gate_write_fd is not None:
+                os.write(gate_write_fd, b"1")
+                os.close(gate_write_fd)
+                gate_write_fd = None
             with log_path.open("r", encoding="utf-8", errors="replace") as log_reader:
                 while True:
                     while True:

@@ -119,3 +119,17 @@ GLOVEMODEL/staging/
 GLOVEMODEL/backups/
 GLOVEMODEL/artifacts/*
 !GLOVEMODEL/artifacts/.gitkeep
+
+# macOS AppleDouble metadata copied together with the project
+._*
+
+# Vega (advisory model) training outputs
+VEGAMODEL/staging/
+VEGAMODEL/backups/
+VEGAMODEL/artifacts/*.pt
+VEGAMODEL/artifacts/*.tmp
+
+# Misc local state
+*.tmp
+tables/
+.claude/

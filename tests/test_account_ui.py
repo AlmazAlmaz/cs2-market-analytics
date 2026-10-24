@@ -253,6 +253,7 @@ def test_account_pages_render_server_locale_and_visible_persistent_switch(render
 @pytest.mark.parametrize(
     "document",
     [account_ui.render_auth_page("login", "en"), account_ui.render_account_page("en")],
+    ids=("auth", "account"),
 )
 def test_every_static_translation_marker_has_ru_and_en_entries(document):
     ru_start = document.index("ru: {")

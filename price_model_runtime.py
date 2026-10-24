@@ -1,6 +1,7 @@
 import json
 import math
 import threading
+from copy import copy
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -8,6 +9,9 @@ from urllib.parse import parse_qs, unquote, urlparse
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import TargetEncoder
 
 import app_config
 import model_generations
@@ -24,6 +28,72 @@ MODEL_CACHE = None
 MODEL_MTIME = None
 _RUNTIME_SLOT = None
 _RUNTIME_SLOT_LOCK = threading.Lock()
+
+
+class _RuntimeStringTargetEncoder(TargetEncoder):
+    """A fitted string encoder that keeps its category lookups between rows.
+
+    sklearn rebuilds the full vocabulary lookup for each transform. Live
+    inference has only a few rows, so reuse the immutable fitted encodings.
+    Other input types still go through sklearn's validation and transform.
+    """
+
+    def transform(self, X):
+        if (
+            not isinstance(X, pd.DataFrame)
+            or len(X) == 0
+            or list(X.columns) != list(self.feature_names_in_)
+        ):
+            return super().transform(X)
+        columns = [X.iloc[:, index].to_numpy() for index in range(X.shape[1])]
+        if any(not isinstance(value, str) for column in columns for value in column):
+            return super().transform(X)
+        result = np.empty(X.shape, dtype=np.float64)
+        for index, (column, lookup) in enumerate(zip(columns, self._runtime_lookups)):
+            result[:, index] = [lookup.get(value, self.target_mean_) for value in column]
+        return result
+
+
+def _prepare_live_prediction_pipeline(pipeline):
+    """Copy a supported fitted pipeline; never change an on-disk artifact."""
+
+    if type(pipeline) is not Pipeline:
+        return pipeline
+    steps = []
+    changed = False
+    for name, step in pipeline.steps:
+        if type(step) is ColumnTransformer:
+            transformers = []
+            for label, encoder, columns in step.transformers_:
+                if (
+                    type(encoder) is TargetEncoder
+                    and encoder.target_type_ == "continuous"
+                    and hasattr(encoder, "feature_names_in_")
+                    and all(
+                        isinstance(category, str)
+                        for categories in encoder.categories_
+                        for category in categories
+                    )
+                ):
+                    runtime_encoder = _RuntimeStringTargetEncoder(**encoder.get_params())
+                    runtime_encoder.__dict__.update(encoder.__dict__)
+                    runtime_encoder._runtime_lookups = [
+                        dict(zip(categories, encodings))
+                        for categories, encodings in zip(
+                            encoder.categories_, encoder.encodings_
+                        )
+                    ]
+                    encoder = runtime_encoder
+                    changed = True
+                transformers.append((label, encoder, columns))
+            step = copy(step)
+            step.transformers_ = transformers
+        steps.append((name, step))
+    if not changed:
+        return pipeline
+    prepared = copy(pipeline)
+    prepared.steps = steps
+    return prepared
 
 
 def extract_wear_name(market_hash_name):
@@ -58,6 +128,9 @@ def load_bundle_from_directory(directory):
     declared_kind = artifact.get("item_kind")
     if declared_kind is not None and declared_kind != ITEM_KIND_WEAPON_SKIN:
         raise RuntimeError("Almaz artifact is not a weapon-skin model")
+    for name in ("pipeline", "low_pipeline", "high_pipeline"):
+        if artifact.get(name) is not None:
+            artifact[name] = _prepare_live_prediction_pipeline(artifact[name])
     artifact["_runtime_source_dir"] = str(directory)
     artifact["_runtime_generation_id"] = (
         directory.name

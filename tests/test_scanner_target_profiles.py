@@ -24,7 +24,7 @@ def candidates(count=5):
     ]
 
 
-def test_recommended_selection_prioritizes_manual_include_and_honors_cap():
+def test_recommended_selection_prioritizes_manual_include_over_automatic_cap():
     control = target_control(
         include=["knife:Knife 4"],
         exclude=["knife:Knife 1"],
@@ -32,7 +32,7 @@ def test_recommended_selection_prioritizes_manual_include_and_honors_cap():
 
     selected, meta = scanner_target_profiles.apply_profile_selection(
         "knives",
-        candidates(),
+        candidates(6),
         control,
         recommended_limit=3,
     )
@@ -41,7 +41,10 @@ def test_recommended_selection_prioritizes_manual_include_and_honors_cap():
         "knife:Knife 4",
         "knife:Knife 0",
         "knife:Knife 2",
+        "knife:Knife 3",
     ]
+    assert meta["configured_pool_cap"] == 3
+    assert meta["selected_count"] == 4
     assert meta["selection_truncated"] is True
 
 

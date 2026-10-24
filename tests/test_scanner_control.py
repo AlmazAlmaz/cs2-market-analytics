@@ -1,4 +1,5 @@
 import json
+import os
 import stat
 import threading
 
@@ -24,8 +25,9 @@ def test_control_persists_schema_defaults_and_private_mode(tmp_path):
     assert stored["schema_version"] == scanner_control.CONTROL_SCHEMA_VERSION
     assert stored["enabled"] is True
     assert stored["interval_seconds"] == 600
-    assert file_mode(path) == 0o600
-    assert file_mode(tmp_path / ".control.json.lock") == 0o600
+    if os.name != "nt":
+        assert file_mode(path) == 0o600
+        assert file_mode(tmp_path / ".control.json.lock") == 0o600
 
 
 def test_relative_control_path_is_resolved_from_project(monkeypatch, tmp_path):
@@ -50,7 +52,8 @@ def test_partial_updates_are_validated_and_preserve_other_fields(tmp_path):
     assert changed_interval["enabled"] is False
     assert changed_interval["interval_seconds"] == 300
     assert changed_interval["status"] == "paused"
-    assert file_mode(path) == 0o600
+    if os.name != "nt":
+        assert file_mode(path) == 0o600
 
 
 @pytest.mark.parametrize("value", [True, 59, 86401, 1.5, "not-a-number"])
@@ -134,7 +137,7 @@ def test_atomic_write_fsyncs_file_and_parent_directory(monkeypatch, tmp_path):
         path=tmp_path / "control.json",
     )
 
-    assert len(fsynced) >= 2
+    assert len(fsynced) >= (1 if os.name == "nt" else 2)
 
 
 def test_concurrent_partial_updates_do_not_lose_fields(tmp_path):
@@ -210,7 +213,8 @@ def test_runtime_status_is_separate_validated_and_redacts_secrets(tmp_path):
     assert "top-secret" not in status["last_error"]
     assert "also-secret" not in status["last_error"]
     assert "***" in status["last_error"]
-    assert file_mode(path) == 0o600
+    if os.name != "nt":
+        assert file_mode(path) == 0o600
     assert scanner_control.get_scanner_status(path=path) == status
 
 
@@ -246,7 +250,8 @@ def test_target_control_defaults_are_private_and_profile_complete(tmp_path):
     assert state["profiles"]["knives"]["enabled"] is True
     assert state["profiles"]["gloves"]["enabled"] is False
     assert state["profiles"]["liquid_under_10"]["selection_mode"] == "recommended"
-    assert file_mode(path) == 0o600
+    if os.name != "nt":
+        assert file_mode(path) == 0o600
 
 
 def test_target_control_partial_patch_uses_revision_and_replaces_lists(tmp_path):

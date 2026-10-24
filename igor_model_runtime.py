@@ -2,6 +2,9 @@ import json
 import pickle
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,6 +34,21 @@ _RUNTIME_SLOT = None
 _RUNTIME_SLOT_LOCK = threading.Lock()
 RUNTIME_STATS_CACHE = {}
 RUNTIME_STATS_TTL_SECONDS = 600
+_FEATURE_PREPARATION_CACHE = ContextVar(
+    "igor_feature_preparation_cache",
+    default=None,
+)
+
+
+@contextmanager
+def feature_preparation_cache():
+    """Reuse model-independent feature work within one live listing only."""
+
+    token = _FEATURE_PREPARATION_CACHE.set({})
+    try:
+        yield
+    finally:
+        _FEATURE_PREPARATION_CACHE.reset(token)
 
 
 def validate_metadata_contract(metadata):
@@ -528,8 +546,7 @@ def build_raw_row(payload, conn):
     return row, stickers
 
 
-def build_feature_frame(payload, conn, metadata):
-    contract_version = int(metadata.get("feature_contract_version", 1))
+def _build_base_feature_frame(payload, conn, contract_version):
     raw_row, stickers, keychains = build_raw_row_with_keychains(
         payload, conn, contract_version=contract_version
     )
@@ -546,9 +563,29 @@ def build_feature_frame(payload, conn, metadata):
     if contract_version >= 2:
         frame = igor_features.build_keychain_derived_features(frame)
 
+    return frame, stickers, keychains
+
+
+def build_feature_frame(payload, conn, metadata):
+    contract_version = int(metadata.get("feature_contract_version", 1))
+    cache = _FEATURE_PREPARATION_CACHE.get()
+    cache_key = (id(payload), id(conn), contract_version)
+    prepared = cache.get(cache_key) if cache is not None else None
+    if prepared is None:
+        prepared = _build_base_feature_frame(payload, conn, contract_version)
+        if cache is not None:
+            cache[cache_key] = prepared
+    base_frame, stickers, keychains = prepared
+    # The remaining columns depend on each artifact's own training history;
+    # keep those model-specific while reusing parsing/DB enrichment above.
+    frame = base_frame.copy(deep=True)
+
     seed_counts = metadata.get("seed_encoder_counts") or {}
     frame["seed_popularity"] = np.log1p(
-        frame["skin_seed_key"].map(seed_counts).fillna(0).astype(int)
+        # Passing the whole dictionary makes pandas build an index over every
+        # training seed on each live prediction.  The callable only looks up
+        # the keys present in this frame, preserving missing-key semantics.
+        frame["skin_seed_key"].map(seed_counts.get).fillna(0).astype(int)
     )
 
     weapon_type = str(frame["weapon_type"].iloc[0])
@@ -583,7 +620,7 @@ def build_feature_frame(payload, conn, metadata):
                 .fillna(0)
             )
 
-    return frame, feature_cols, stickers, keychains
+    return frame, feature_cols, deepcopy(stickers), deepcopy(keychains)
 
 
 def predict_deal(payload, conn=None):

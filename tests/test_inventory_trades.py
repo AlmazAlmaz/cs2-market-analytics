@@ -168,11 +168,11 @@ def test_v3_migration_is_additive_backfills_exact_basis_and_is_idempotent(tmp_pa
     account_backend.AccountService(path).close()
 
     with sqlite3.connect(path) as conn:
-        assert account_backend.SCHEMA_VERSION == 3
+        assert account_backend.SCHEMA_VERSION >= 3
         assert conn.execute(
             "SELECT version FROM app_schema_versions WHERE component = ?",
             (account_backend.SCHEMA_COMPONENT,),
-        ).fetchone()[0] == 3
+        ).fetchone()[0] == account_backend.SCHEMA_VERSION
         assert {
             row[0]
             for row in conn.execute(

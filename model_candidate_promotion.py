@@ -39,6 +39,7 @@ import joblib
 import app_config
 import model_generations
 import model_lifecycle
+import portable_os
 from item_classification import STRICT_ITEM_KIND_POLICY
 from NEURALMODEL.features import CAT_FEATURES as NOVA_CAT_FEATURES
 from NEURALMODEL.features import FEATURE_CONTRACT_SHA256 as NOVA_FEATURE_CONTRACT_SHA256
@@ -212,7 +213,10 @@ def _canonical_sha256(value: Any) -> str:
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
-    flags = os.O_RDONLY
+    # Raw ``os.read`` follows the CRT descriptor mode on Windows.  Without
+    # O_BINARY, CRLF and 0x1A bytes in PyTorch/joblib artifacts are translated
+    # and the digest no longer represents the immutable on-disk bytes.
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -1482,8 +1486,8 @@ def _assert_services_offline() -> None:
 def _promotion_lock(lock_path: Path) -> Iterator[None]:
     try:
         import fcntl
-    except ImportError as exc:  # pragma: no cover - production is macOS/Linux.
-        raise PromotionError("model promotion requires POSIX fcntl locking") from exc
+    except ImportError:  # Windows
+        import portable_fcntl as fcntl
     if not _PROMOTION_THREAD_LOCK.acquire(blocking=False):
         raise PromotionError(
             "another model promotion is already running in this process"
@@ -1499,7 +1503,7 @@ def _promotion_lock(lock_path: Path) -> Iterator[None]:
             flags |= os.O_NOFOLLOW
         try:
             descriptor = os.open(lock_path, flags, 0o600)
-            os.fchmod(descriptor, 0o600)
+            portable_os.fchmod(descriptor, 0o600)
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             os.ftruncate(descriptor, 0)
             os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
@@ -1529,14 +1533,7 @@ def _canonical_promotion_lock_path() -> Path:
 
 
 def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    descriptor = os.open(path, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    portable_os.fsync_directory(path)
 
 
 def _atomic_json(value: Mapping[str, Any], path: Path) -> None:
@@ -1558,7 +1555,8 @@ def _atomic_joblib(value: Mapping[str, Any], path: Path) -> None:
         if temporary.exists():
             raise PromotionError(f"refusing existing temporary file: {temporary}")
         joblib.dump(dict(value), temporary)
-        with temporary.open("rb") as handle:
+        # FlushFileBuffers requires a writable handle on Windows.
+        with temporary.open("r+b") as handle:
             os.fsync(handle.fileno())
         os.replace(temporary, path)
     finally:
@@ -1566,7 +1564,7 @@ def _atomic_joblib(value: Mapping[str, Any], path: Path) -> None:
 
 
 def _copy_verified(source: Path, destination: Path, expected_sha256: str) -> None:
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:

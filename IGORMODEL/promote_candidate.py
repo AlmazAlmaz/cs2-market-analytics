@@ -33,6 +33,7 @@ from catboost import CatBoostRegressor
 import app_config
 import model_generations
 import model_lifecycle
+import portable_os
 from item_classification import ITEM_KIND_WEAPON_SKIN, STRICT_ITEM_KIND_POLICY
 
 try:
@@ -76,6 +77,14 @@ _PROMOTION_THREAD_LOCK = threading.Lock()
 
 class PromotionError(RuntimeError):
     """Candidate validation or safe promotion failed."""
+
+    classification = "integrity"
+
+
+class CandidateQualityError(PromotionError):
+    """A coherent candidate failed a numerical quality threshold."""
+
+    classification = "quality"
 
 
 class _PrimitiveOnlyUnpickler(pickle.Unpickler):
@@ -467,7 +476,9 @@ def _validate_quality_gate(
             "Igor candidate has no shared_holdout_comparison; refusing unproven promotion"
         )
     if comparison.get("staging_proves_primary_improvement") is not True:
-        raise PromotionError("shared holdout does not prove primary improvement")
+        raise CandidateQualityError(
+            "shared holdout does not prove primary improvement"
+        )
     holdout_rows = _require_int(
         comparison.get("holdout_rows"),
         "shared_holdout_comparison.holdout_rows",
@@ -491,7 +502,9 @@ def _validate_quality_gate(
         delta = _require_number(deltas.get(name), f"shared delta.{name}")
         test_value = _require_number(test.get(name), f"metrics.test.{name}", minimum=0)
         if not new < old:
-            raise PromotionError(f"shared holdout {name} is not strictly better")
+            raise CandidateQualityError(
+                f"shared holdout {name} is not strictly better"
+            )
         if not math.isclose(delta, new - old, rel_tol=1e-9, abs_tol=1e-12):
             raise PromotionError(f"shared holdout delta for {name} is inconsistent")
         if not math.isclose(test_value, new, rel_tol=1e-9, abs_tol=1e-12):
@@ -512,21 +525,36 @@ def _validate_quality_gate(
     raw_coverage = _require_number(
         metrics.get("test_raw_interval_coverage_15_85"),
         "metrics.test_raw_interval_coverage_15_85",
-        minimum=MIN_RAW_INTERVAL_COVERAGE,
+        minimum=0,
         maximum=1,
     )
     crossing = _require_number(
         metrics.get("test_raw_quantile_crossing_rate"),
         "metrics.test_raw_quantile_crossing_rate",
         minimum=0,
-        maximum=MAX_QUANTILE_CROSSING_RATE,
+        maximum=1,
     )
     point_outside = _require_number(
         metrics.get("test_point_outside_raw_interval_rate"),
         "metrics.test_point_outside_raw_interval_rate",
         minimum=0,
-        maximum=MAX_POINT_OUTSIDE_RATE,
+        maximum=1,
     )
+    if raw_coverage < MIN_RAW_INTERVAL_COVERAGE:
+        raise CandidateQualityError(
+            "metrics.test_raw_interval_coverage_15_85 must be at least "
+            f"{MIN_RAW_INTERVAL_COVERAGE}"
+        )
+    if crossing > MAX_QUANTILE_CROSSING_RATE:
+        raise CandidateQualityError(
+            "metrics.test_raw_quantile_crossing_rate must be at most "
+            f"{MAX_QUANTILE_CROSSING_RATE}"
+        )
+    if point_outside > MAX_POINT_OUTSIDE_RATE:
+        raise CandidateQualityError(
+            "metrics.test_point_outside_raw_interval_rate must be at most "
+            f"{MAX_POINT_OUTSIDE_RATE}"
+        )
     comparison_coverage = _require_number(
         comparison.get("staging_interval_coverage_15_85"),
         "shared_holdout_comparison.staging_interval_coverage_15_85",
@@ -829,8 +857,8 @@ def _assert_services_offline() -> None:
 def _promotion_lock(lock_path: Path) -> Iterator[None]:
     try:
         import fcntl
-    except ImportError as exc:  # pragma: no cover - production is macOS/Linux.
-        raise PromotionError("Igor promotion requires POSIX fcntl locking") from exc
+    except ImportError:  # Windows
+        import portable_fcntl as fcntl
 
     if not _PROMOTION_THREAD_LOCK.acquire(blocking=False):
         raise PromotionError("another Igor promotion is already running in this process")
@@ -844,7 +872,7 @@ def _promotion_lock(lock_path: Path) -> Iterator[None]:
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             descriptor = os.open(lock_path, flags, 0o600)
-            os.fchmod(descriptor, 0o600)
+            portable_os.fchmod(descriptor, 0o600)
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
@@ -879,14 +907,7 @@ def _canonical_promotion_lock_path() -> Path:
 
 
 def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    descriptor = os.open(path, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    portable_os.fsync_directory(path)
 
 
 def _atomic_pickle(value: dict[str, Any], path: Path) -> None:
@@ -921,7 +942,10 @@ def _atomic_json(value: dict[str, Any], path: Path) -> None:
 
 
 def _copy_verified(source: Path, destination: Path, expected_sha256: str) -> None:
-    flags = os.O_RDONLY
+    # Windows CRT descriptors default to text mode unless O_BINARY is explicit.
+    # Keep every byte (notably CRLF and 0x1A) unchanged so the digest verified
+    # here is the same digest produced by the binary candidate validator.
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     source_fd = os.open(source, flags)

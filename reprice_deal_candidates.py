@@ -8,6 +8,7 @@ import app_config
 import deal_intelligence
 import deal_scanner
 import igor_model_runtime
+import model_generations
 import neural_model_runtime
 import price_model_runtime
 from item_classification import ITEM_KIND_WEAPON_SKIN, classify_market_hash_name
@@ -36,6 +37,12 @@ def main():
         "igor": igor_model_runtime.predict_deal,
         "nova": neural_model_runtime.predict_deal,
     }
+    if model_generations.read_active_pointer(
+        "vega", project_dir=app_config.PROJECT_DIR
+    ) is not None:
+        import vega_model_runtime
+
+        models["vega"] = vega_model_runtime.predict_deal
     config = deal_scanner.load_config()
 
     with connect_db() as conn:

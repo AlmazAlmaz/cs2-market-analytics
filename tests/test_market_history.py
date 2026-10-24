@@ -185,10 +185,12 @@ def test_schema_is_isolated_and_registers_legacy_provenance(tmp_path: Path) -> N
             Path(f"{database}-shm"),
         ):
             assert sidecar.exists()
-            assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+            if os.name != "nt":
+                assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
     finally:
         connection.close()
-    assert stat.S_IMODE(database.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(database.stat().st_mode) == 0o600
 
 
 def test_database_with_legacy_sales_table_is_rejected(tmp_path: Path) -> None:
@@ -216,7 +218,8 @@ def test_default_private_parent_is_tightened(
     monkeypatch.setenv("CS2_DB_PATH", str(tmp_path / "legacy.db"))
     connection = history.connect_database()
     connection.close()
-    assert stat.S_IMODE(private.stat().st_mode) == 0o700
+    if os.name != "nt":
+        assert stat.S_IMODE(private.stat().st_mode) == 0o700
 
 
 def test_ecb_cross_rate_and_weekend_resolution_are_exact(tmp_path: Path) -> None:
@@ -674,7 +677,12 @@ def test_manual_zip_reader_rejects_symlink(tmp_path: Path) -> None:
     target = tmp_path / "target.zip"
     target.write_bytes(_zip_payload([_sale()]))
     link = tmp_path / "link.zip"
-    os.symlink(target, link)
+    try:
+        os.symlink(target, link)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is not enabled")
+        raise
     with pytest.raises(history.ValidationError) as raised:
         history.read_zip_file_bounded(link)
     assert raised.value.code == "unsafe_zip_file"

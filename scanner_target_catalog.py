@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,10 @@ DEFAULT_CONFIG_PATH = app_config.PROJECT_DIR / "deal_scanner_config.json"
 DEFAULT_SKIN_CATALOG_PATH = app_config.path("CS2_SKINS_PATH", "ALL_SKINS.json")
 MAX_LOCAL_CANDIDATES = 25_000
 MAX_STICKER_SEARCH_CANDIDATES = 2_000
+STICKER_GROUP_CACHE_TTL_SECONDS = 30.0
+MAX_STICKER_GROUP_CACHE_ENTRIES = 8
+_sticker_group_cache: dict[tuple[Any, ...], tuple[float, list[dict[str, Any]]]] = {}
+_sticker_group_cache_lock = threading.Lock()
 
 _PROFILE_BUDGETS = {
     scanner_target_profiles.PROFILE_STICKER_GUNS: (
@@ -122,6 +128,38 @@ def profile_defaults(config: Mapping[str, Any]) -> dict[str, bool]:
     }
 
 
+def profile_budget_defaults(config: Mapping[str, Any]) -> dict[str, int]:
+    """Translate validated legacy config limits into live profile defaults."""
+
+    result: dict[str, int] = {}
+    for profile, fields in _PROFILE_BUDGETS.items():
+        targets_field = fields[0]
+        target_bounds = fields[4]
+        configured = _bounded_int(
+            config.get(targets_field, _CONFIG_DEFAULTS[targets_field]),
+            targets_field,
+            target_bounds,
+        )
+        minimum, maximum = scanner_control.TARGETS_PER_CYCLE_LIMITS[profile]
+        result[profile] = min(max(configured, minimum), maximum)
+    return result
+
+
+def profile_listing_defaults(config: Mapping[str, Any]) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for profile, fields in _PROFILE_BUDGETS.items():
+        listings_field = fields[1]
+        listing_bounds = fields[5]
+        configured = _bounded_int(
+            config.get(listings_field, _CONFIG_DEFAULTS[listings_field]),
+            listings_field,
+            listing_bounds,
+        )
+        minimum, maximum = scanner_control.LISTINGS_PER_TARGET_LIMITS[profile]
+        result[profile] = min(max(configured, minimum), maximum)
+    return result
+
+
 def build_target_control_payload(
     *,
     config: Mapping[str, Any] | None = None,
@@ -134,10 +172,16 @@ def build_target_control_payload(
         target_control
         or scanner_control.get_scanner_target_control(
             profile_defaults=profile_defaults(config),
+            budget_defaults=profile_budget_defaults(config),
+            listing_defaults=profile_listing_defaults(config),
             create_if_missing=True,
         )
     )
-    control = scanner_control.validate_scanner_target_control(control)
+    control = scanner_control.validate_scanner_target_control(
+        control,
+        budget_defaults=profile_budget_defaults(config),
+        listing_defaults=profile_listing_defaults(config),
+    )
     return {
         "control": control,
         "profile_order": list(scanner_target_profiles.PROFILE_ORDER),
@@ -148,6 +192,23 @@ def build_target_control_payload(
             "max_excluded_targets": scanner_control.MAX_EXCLUDED_TARGETS,
             "max_target_key_length": scanner_control.MAX_TARGET_KEY_LENGTH,
             "max_request_body_bytes": scanner_control.TARGET_CONTROL_BODY_LIMIT,
+            "targets_per_cycle": {
+                profile: {
+                    "min": bounds[0],
+                    "max": bounds[1],
+                    "default": profile_budget_defaults(config)[profile],
+                }
+                for profile, bounds in scanner_control.TARGETS_PER_CYCLE_LIMITS.items()
+            },
+            "listings_per_target": {
+                profile: {
+                    "min": bounds[0],
+                    "max": bounds[1],
+                    "default": profile_listing_defaults(config)[profile],
+                }
+                for profile, bounds in scanner_control.LISTINGS_PER_TARGET_LIMITS.items()
+            },
+            "max_included_groups": scanner_control.MAX_INCLUDED_GROUPS,
         },
     }
 
@@ -187,6 +248,8 @@ def update_target_control_from_payload(
     current = scanner_control.get_scanner_target_control(
         path=path,
         profile_defaults=defaults,
+        budget_defaults=profile_budget_defaults(config),
+        listing_defaults=profile_listing_defaults(config),
         create_if_missing=False,
     )
     if current.get("error"):
@@ -211,7 +274,11 @@ def update_target_control_from_payload(
             )
         candidate["profiles"][name].update(changes)
     try:
-        scanner_control.validate_scanner_target_control(candidate)
+        scanner_control.validate_scanner_target_control(
+            candidate,
+            budget_defaults=profile_budget_defaults(config),
+            listing_defaults=profile_listing_defaults(config),
+        )
     except scanner_control.ScannerControlError as exc:
         # The persisted document above was already validated, so an error in
         # the merged candidate is a client-payload validation failure (400),
@@ -222,6 +289,8 @@ def update_target_control_from_payload(
         profile_changes,
         expected_revision=expected_revision,
         profile_defaults=defaults,
+        budget_defaults=profile_budget_defaults(config),
+        listing_defaults=profile_listing_defaults(config),
         path=path,
     )
     return build_target_control_payload(config=config, target_control=updated)
@@ -239,7 +308,11 @@ def _bounded_int(value: Any, field: str, bounds: tuple[int, int]) -> int:
     return number
 
 
-def _profile_budget(profile: str, config: Mapping[str, Any]):
+def _profile_budget(
+    profile: str,
+    config: Mapping[str, Any],
+    target_control: Mapping[str, Any],
+):
     try:
         (
             targets_field,
@@ -253,13 +326,42 @@ def _profile_budget(profile: str, config: Mapping[str, Any]):
         ) = _PROFILE_BUDGETS[profile]
     except KeyError as exc:
         raise ValueError(f"unknown scanner target profile: {profile}") from exc
+    configured_targets = _bounded_int(
+        config.get(targets_field, _CONFIG_DEFAULTS[targets_field]),
+        targets_field,
+        target_bounds,
+    )
+    profile_settings = scanner_target_profiles.profile_settings(
+        target_control,
+        profile,
+    )
+    live_targets = profile_settings.get("targets_per_cycle", configured_targets)
+    minimum, maximum = scanner_control.TARGETS_PER_CYCLE_LIMITS[profile]
+    live_targets = _bounded_int(
+        live_targets,
+        f"{profile}.targets_per_cycle",
+        (minimum, maximum),
+    )
+    configured_listings = _bounded_int(
+        config.get(listings_field, _CONFIG_DEFAULTS[listings_field]),
+        listings_field,
+        listing_bounds,
+    )
+    live_listings = profile_settings.get(
+        "listings_per_target",
+        configured_listings,
+    )
+    listing_minimum, listing_maximum = scanner_control.LISTINGS_PER_TARGET_LIMITS[
+        profile
+    ]
+    live_listings = _bounded_int(
+        live_listings,
+        f"{profile}.listings_per_target",
+        (listing_minimum, listing_maximum),
+    )
     budget = {
-        "targets_per_cycle": _bounded_int(
-            config.get(targets_field), targets_field, target_bounds
-        ),
-        "listings_per_target": _bounded_int(
-            config.get(listings_field), listings_field, listing_bounds
-        ),
+        "targets_per_cycle": live_targets,
+        "listings_per_target": live_listings,
         "pages_per_target": _bounded_int(
             config.get(pages_field), pages_field, page_bounds
         ),
@@ -303,6 +405,89 @@ def _config_string_list(config: Mapping[str, Any], field: str) -> list[str]:
             raise ValueError(f"{field} contains an invalid value")
         values.append(value)
     return list(dict.fromkeys(values))
+
+
+def sticker_tournament(name: Any) -> str | None:
+    """Return an exact tournament suffix, never a middle-name substring."""
+
+    parts = [part.strip() for part in str(name or "").split(" | ")]
+    if len(parts) < 3 or not parts[-1]:
+        return None
+    return parts[-1]
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _sticker_group_catalog(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    columns = _table_columns(conn, "sale_stickers")
+    if not {"sticker_id", "name"}.issubset(columns):
+        return []
+    members: dict[str, set[int]] = {}
+    for row in conn.execute(
+        """
+        SELECT sticker_id, name
+        FROM sale_stickers
+        WHERE sticker_id IS NOT NULL AND name IS NOT NULL
+        GROUP BY sticker_id, name
+        ORDER BY sticker_id, name
+        """
+    ):
+        try:
+            sticker_id = int(row[0])
+        except (TypeError, ValueError):
+            continue
+        if sticker_id < 0:
+            continue
+        tournament = sticker_tournament(row[1])
+        if tournament:
+            members.setdefault(tournament, set()).add(sticker_id)
+
+    def sort_key(item: tuple[str, set[int]]):
+        name = item[0]
+        year = next(
+            (int(token) for token in reversed(name.split()) if token.isdigit() and len(token) == 4),
+            0,
+        )
+        return (-year, name.casefold())
+
+    return [
+        {"name": name, "target_count": len(sticker_ids)}
+        for name, sticker_ids in sorted(members.items(), key=sort_key)
+    ]
+
+
+def _cached_sticker_group_catalog(
+    conn: sqlite3.Connection,
+    path: Path,
+) -> list[dict[str, Any]]:
+    """Reuse observed tournament counts while paging or typing a search.
+
+    WAL updates may take up to 30 seconds to appear. Replacing/checkpointing the
+    database invalidates the fingerprint immediately. Selection and configured
+    recommendations are applied separately and are never cached here.
+    """
+
+    stat = path.stat()
+    key = (str(path), stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+    with _sticker_group_cache_lock:
+        now = time.monotonic()
+        cached = _sticker_group_cache.get(key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        groups = _sticker_group_catalog(conn)
+        for old_key, (expires_at, _) in list(_sticker_group_cache.items()):
+            if expires_at <= now or old_key[0] == key[0]:
+                del _sticker_group_cache[old_key]
+        if len(_sticker_group_cache) >= MAX_STICKER_GROUP_CACHE_ENTRIES:
+            oldest_key = min(_sticker_group_cache, key=lambda item: _sticker_group_cache[item][0])
+            del _sticker_group_cache[oldest_key]
+        _sticker_group_cache[key] = (
+            time.monotonic() + STICKER_GROUP_CACHE_TTL_SECONDS,
+            groups,
+        )
+        return groups
 
 
 def _schedule_velocity(conn: sqlite3.Connection) -> dict[str, float]:
@@ -353,6 +538,7 @@ def _sticker_candidates(
         scanner_target_profiles.PROFILE_STICKER_GUNS,
     )
     manual = set(settings["include"])
+    included_groups = set(settings.get("include_groups") or [])
     manual_ids = []
     for key in manual:
         try:
@@ -370,6 +556,9 @@ def _sticker_candidates(
     for value in extra_sticker_names:
         where_parts.append("name = ?")
         params.append(value)
+    for value in sorted(included_groups):
+        where_parts.append("name LIKE ? ESCAPE '\\'")
+        params.append(f"% | {_escape_like(value)}")
     if manual_ids:
         placeholders = ",".join("?" for _ in manual_ids)
         where_parts.append(f"sticker_id IN ({placeholders})")
@@ -391,9 +580,13 @@ def _sticker_candidates(
     )
     query_limit = min(
         MAX_LOCAL_CANDIDATES,
-        pool_limit
-        + scanner_control.MAX_INCLUDED_TARGETS
-        + (MAX_STICKER_SEARCH_CANDIDATES if search_value else 0),
+        (
+            MAX_LOCAL_CANDIDATES
+            if included_groups
+            else pool_limit
+            + scanner_control.MAX_INCLUDED_TARGETS
+            + (MAX_STICKER_SEARCH_CANDIDATES if search_value else 0)
+        ),
     )
     manual_order = ""
     order_params: list[Any] = []
@@ -420,6 +613,7 @@ def _sticker_candidates(
         name = str(row[1] or "").strip()
         key = f"sticker:{row[0]}"
         folded = name.casefold()
+        group_included = sticker_tournament(name) in included_groups
         recommended = (
             key in manual
             or folded in extras
@@ -434,11 +628,13 @@ def _sticker_candidates(
                 "avg_price_cents": round(_finite_float(row[3])),
                 "max_price_cents": round(_finite_float(row[4])),
                 "recommended_candidate": recommended,
+                "group_included": group_included,
             }
         )
     rows.sort(
         key=lambda row: (
             -int(row["target_key"] in manual),
+            -int(row["group_included"]),
             -int(row["recommended_candidate"]),
             -row["max_price_cents"],
             -row["seen_count"],
@@ -454,6 +650,34 @@ def _skin_catalog_path(config: Mapping[str, Any]) -> Path:
         return Path(DEFAULT_SKIN_CATALOG_PATH)
     path = Path(raw).expanduser()
     return path if path.is_absolute() else app_config.PROJECT_DIR / path
+
+
+def _catalog_item_kinds(
+    conn: sqlite3.Connection,
+    names: list[str],
+) -> dict[str, str]:
+    """Resolve authoritative classifications with bounded bulk lookups."""
+
+    if not item_classification.catalog_table_available(conn):
+        return {}
+    names = list(dict.fromkeys(name for name in names if name))
+    result = {}
+    try:
+        for start in range(0, len(names), 500):
+            batch = names[start : start + 500]
+            placeholders = ",".join("?" for _ in batch)
+            for name, kind in conn.execute(
+                "SELECT market_hash_name, item_kind FROM cs2_item_catalog "
+                f"WHERE market_hash_name IN ({placeholders})",
+                batch,
+            ):
+                if kind in item_classification.CATALOG_ITEM_KINDS:
+                    result[name] = kind
+    except sqlite3.Error:
+        # Match the existing per-item classifier's fallback for unavailable or
+        # incomplete catalog schemas.
+        return {}
+    return result
 
 
 def _liquid_candidates(
@@ -490,15 +714,24 @@ def _liquid_candidates(
         scanner_target_profiles.PROFILE_LIQUID_UNDER_10,
     )
     manual = set(settings["include"])
+    catalog_rows = catalog[:MAX_LOCAL_CANDIDATES]
+    item_kinds = _catalog_item_kinds(
+        conn,
+        [
+            str(raw.get("market_hash_name") or "").strip()
+            for raw in catalog_rows
+            if isinstance(raw, dict)
+        ],
+    )
     by_name: dict[str, dict[str, Any]] = {}
-    for order, raw in enumerate(catalog[:MAX_LOCAL_CANDIDATES]):
+    for order, raw in enumerate(catalog_rows):
         if not isinstance(raw, dict):
             continue
         name = str(raw.get("market_hash_name") or "").strip()
-        if (
-            item_classification.classify_market_hash_name(name, conn=conn)
-            != item_classification.ITEM_KIND_WEAPON_SKIN
-        ):
+        item_kind = item_kinds.get(name)
+        if item_kind is None:
+            item_kind = item_classification.classify_name_fallback(name)
+        if item_kind != item_classification.ITEM_KIND_WEAPON_SKIN:
             continue
         base_price = _finite_float(raw.get("base_price_usd"), -1)
         price_cents = round(base_price * 100)
@@ -655,9 +888,14 @@ def build_preview_with_connection(
     limit: Any = 50,
     offset: Any = 0,
     readiness: Mapping[str, Any] | None = None,
+    _sticker_groups: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    target_control = scanner_control.validate_scanner_target_control(target_control)
-    budget, pool_limit = _profile_budget(profile, config)
+    target_control = scanner_control.validate_scanner_target_control(
+        target_control,
+        budget_defaults=profile_budget_defaults(config),
+        listing_defaults=profile_listing_defaults(config),
+    )
+    budget, pool_limit = _profile_budget(profile, config, target_control)
     candidates = load_profile_candidates(
         conn,
         profile,
@@ -688,6 +926,25 @@ def build_preview_with_connection(
         "eventual_catalog_coverage": rotation,
     }
     payload["local_only"] = True
+    if profile == scanner_target_profiles.PROFILE_STICKER_GUNS:
+        included_groups = set(
+            scanner_target_profiles.profile_settings(
+                target_control,
+                profile,
+            ).get("include_groups")
+            or []
+        )
+        payload["groups"] = [
+            {
+                **group,
+                "selected": group["name"] in included_groups,
+            }
+            for group in (
+                _sticker_groups
+                if _sticker_groups is not None
+                else _sticker_group_catalog(conn)
+            )
+        ]
     return payload
 
 
@@ -709,6 +966,8 @@ def build_scanner_target_preview(
         target_control
         or scanner_control.get_scanner_target_control(
             profile_defaults=profile_defaults(config),
+            budget_defaults=profile_budget_defaults(config),
+            listing_defaults=profile_listing_defaults(config),
             create_if_missing=False,
         )
     )
@@ -727,4 +986,9 @@ def build_scanner_target_preview(
             limit=limit,
             offset=offset,
             readiness=readiness,
+            _sticker_groups=(
+                _cached_sticker_group_catalog(conn, path)
+                if profile == scanner_target_profiles.PROFILE_STICKER_GUNS
+                else None
+            ),
         )

@@ -14,14 +14,12 @@ from pathlib import Path
 
 import evaluate_metrics as em
 import features as F
+import numpy as np
 import pandas as pd
 import train as T
 from catboost import CatBoostRegressor
 
 LEGACY_ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts"
-
-BASELINE_TEST_METRICS = T.BASELINE_TEST_METRICS
-BASELINE_TOP100_STICKER_RATIO = T.BASELINE_TOP100_STICKER_RATIO
 
 
 def load_artifacts():
@@ -87,9 +85,25 @@ def diagnostic_report(
     em.print_metrics("train", train_m)
     em.print_metrics("test", test_m)
 
-    print("\n--- vs Baseline (ChatGPT, тот же test-период) ---")
-    for k, v in BASELINE_TEST_METRICS.items():
+    production = T.evaluate_production_bundle(test_df)
+    production_prediction = production["point"]
+    baseline_test_metrics = em.compute_metrics(
+        test_df["price_cents"].to_numpy(), production_prediction
+    )
+    print("\n--- vs current production (the same test rows) ---")
+    comparison_keys = (
+        "median_ape_%",
+        "mean_ape_%",
+        "p90_ape_%",
+        "mae_cents",
+        "rmse_log_price",
+        "r2_log_price",
+    )
+    for k in comparison_keys:
+        v = baseline_test_metrics.get(k)
         new_v = test_m.get(k)
+        if new_v is None or v is None:
+            continue
         better = (new_v < v) if "r2" not in k else (new_v > v)
         arrow = "лучше" if better else "хуже"
         print(f"  {k}: baseline={v}  new={new_v:.3f}  ({arrow})")
@@ -99,8 +113,18 @@ def diagnostic_report(
     print("=" * 80)
     top100 = test_df.nlargest(100, "sum_ref_sticker_price")
     ratio = em.predicted_actual_ratio_summary(top100["price_cents"].values, top100["pred_price_cents"].values)
+    top_positions = np.argsort(test_df["sum_ref_sticker_price"].to_numpy())[
+        -min(100, len(test_df)) :
+    ]
+    baseline_top100_ratio = em.predicted_actual_ratio_summary(
+        test_df["price_cents"].to_numpy()[top_positions],
+        production_prediction[top_positions],
+    )["median_pred_over_actual"]
     print(f"n={ratio['n']}, median predicted/actual = {ratio['median_pred_over_actual']:.3f}")
-    print(f"(baseline RAW ml до калибровки: {BASELINE_TOP100_STICKER_RATIO}, baseline ПОСЛЕ runtime-калибровки: ~1.00)")
+    print(
+        "(current production on the same top rows: "
+        f"{baseline_top100_ratio:.3f})"
+    )
 
     print("\n" + "=" * 80)
     print("СЕГМЕНТЫ (test)")

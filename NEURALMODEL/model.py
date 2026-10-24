@@ -75,3 +75,4 @@ class NovaPriceNet(nn.Module):
         low = center - functional.softplus(raw[:, 1])
         high = center + functional.softplus(raw[:, 2])
         return torch.stack((low, center, high), dim=1)
+

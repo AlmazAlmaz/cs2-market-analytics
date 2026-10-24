@@ -5,6 +5,7 @@ import shutil
 import sqlite3
 import stat
 import sys
+from contextlib import closing
 from copy import deepcopy
 from pathlib import Path
 
@@ -12,6 +13,15 @@ import pytest
 
 import model_generations
 import model_training_jobs as jobs
+
+
+def _symlink_or_skip(path: Path, target, *, target_is_directory=False) -> None:
+    try:
+        path.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is not enabled")
+        raise
 
 
 def _mode(path):
@@ -23,6 +33,7 @@ def _make_project(tmp_path):
         "models/staging",
         "IGORMODEL/staging",
         "NEURALMODEL/staging",
+        "VEGAMODEL/staging",
         "KNIFEMODEL/staging",
         "GLOVEMODEL/staging",
     ):
@@ -33,6 +44,7 @@ def _make_project(tmp_path):
         'NOVA_TRAINING_CONTRACT_VERSION = 2\nPARSER = "--test-rows"\n',
         encoding="utf-8",
     )
+    (tmp_path / "train_vega_model.py").write_text("pass\n", encoding="utf-8")
     (tmp_path / "train_knife_price_model.py").write_text("pass\n", encoding="utf-8")
     (tmp_path / "train_glove_price_model.py").write_text("pass\n", encoding="utf-8")
     return tmp_path
@@ -75,12 +87,14 @@ def test_persistent_status_is_private_and_hides_process_details(tmp_path):
         "almaz",
         "igor",
         "nova",
+        "vega",
         "knives",
         "gloves",
     }
-    assert _mode(paths.state) == 0o600
-    assert _mode(paths.state_lock) == 0o600
-    assert _mode(paths.run_dir) == 0o700
+    if os.name != "nt":
+        assert _mode(paths.state) == 0o600
+        assert _mode(paths.state_lock) == 0o600
+        assert _mode(paths.run_dir) == 0o700
     assert "worker_pid" not in overview["models"]["almaz"]
     assert "trainer_start_token" not in overview["models"]["almaz"]
     assert overview["models"]["almaz"]["promotion_allowed"] is False
@@ -101,6 +115,7 @@ def test_legacy_schema_v1_state_adds_knives_without_losing_terminal_jobs(
     legacy["updated_at"] = "2026-08-20T12:34:56+00:00"
     legacy["models"].pop("knives")
     legacy["models"].pop("gloves")
+    legacy["models"].pop("vega")
     legacy["models"]["almaz"].update(
         {
             "job_id": "a" * 32,
@@ -162,8 +177,10 @@ def test_legacy_schema_v1_state_adds_knives_without_losing_terminal_jobs(
     assert {name: migrated["models"][name] for name in original_jobs} == original_jobs
     assert migrated["models"]["knives"] == jobs._idle_job("knives")
     assert migrated["models"]["gloves"] == jobs._idle_job("gloves")
+    assert migrated["models"]["vega"] == jobs._idle_job("vega")
     assert atomic_writes == [(paths.state, migrated)]
-    assert _mode(paths.state) == 0o600
+    if os.name != "nt":
+        assert _mode(paths.state) == 0o600
     assert not list(paths.run_dir.glob(f".{paths.state.name}.*.tmp"))
 
 
@@ -181,6 +198,7 @@ def test_legacy_almaz_sha_error_is_reclassified_as_integrity_failure(
     legacy = jobs._default_state()
     legacy["models"].pop("knives")
     legacy["models"].pop("gloves")
+    legacy["models"].pop("vega")
     legacy["models"]["almaz"].update(
         {
             "job_id": job_id,
@@ -226,6 +244,32 @@ def test_legacy_almaz_sha_error_is_reclassified_as_integrity_failure(
     assert reread == migrated
 
 
+def test_pre_vega_schema_v1_state_adds_idle_vega_without_losing_history(tmp_path):
+    project = _make_project(tmp_path)
+    paths = jobs._paths(project)
+    paths.run_dir.mkdir(parents=True)
+    previous = jobs._default_state()
+    previous["models"].pop("vega")
+    previous["models"]["gloves"].update(
+        {
+            "job_id": "e" * 32,
+            "state": "succeeded",
+            "phase": "active",
+            "progress_percent": 100.0,
+            "activation_state": "activated",
+            "active_bundle_version": "f" * 64,
+        }
+    )
+    preserved = deepcopy(previous["models"])
+    paths.state.write_text(json.dumps(previous), encoding="utf-8")
+
+    with jobs._locked_state(paths):
+        migrated = jobs._read_state_unlocked(paths)
+
+    assert {name: migrated["models"][name] for name in preserved} == preserved
+    assert migrated["models"]["vega"] == jobs._idle_job("vega")
+
+
 def test_legacy_state_with_unknown_model_is_rejected_without_rewrite(
     tmp_path, monkeypatch
 ):
@@ -258,7 +302,9 @@ def test_legacy_state_with_unknown_model_is_rejected_without_rewrite(
 
 
 def test_progress_parsers_are_monotonic_and_produce_eta(monkeypatch):
-    clock = iter((100.0, 110.0, 120.0, 130.0, 140.0, 150.0, 160.0, 170.0))
+    clock = iter(
+        (100.0, 110.0, 120.0, 130.0, 140.0, 150.0, 160.0, 170.0, 180.0, 190.0)
+    )
     monkeypatch.setattr(jobs.time, "monotonic", lambda: next(clock))
 
     igor = jobs.ProgressTracker("igor", started_monotonic=90.0)
@@ -278,6 +324,9 @@ def test_progress_parsers_are_monotonic_and_produce_eta(monkeypatch):
     nova = jobs.ProgressTracker("nova", started_monotonic=90.0)
     nova.feed("parameters: 8,000,000")
     assert nova.feed("epoch 09 train=0.1 val=0.1")[1] == 59
+    vega = jobs.ProgressTracker("vega", started_monotonic=90.0)
+    vega.feed("parameters: 18,000,000")
+    assert vega.feed("epoch 10 train=0.1 val=0.1")[1] == 59
     assert jobs._duration_seconds("500ms") == pytest.approx(0.5)
     assert jobs._duration_seconds("1m 2s") == pytest.approx(62)
     assert jobs._duration_seconds("250us") == pytest.approx(0.00025)
@@ -297,7 +346,11 @@ def test_managed_state_rejects_intermediate_symlink(tmp_path):
     project = _make_project(tmp_path / "project")
     redirected = tmp_path / "redirected"
     redirected.mkdir()
-    (project / ".run").symlink_to(redirected)
+    _symlink_or_skip(
+        project / ".run",
+        redirected,
+        target_is_directory=True,
+    )
 
     with pytest.raises(jobs.TrainingJobError, match="symlink directory"):
         jobs.get_training_overview(project_dir=project)
@@ -357,6 +410,50 @@ def test_recovery_does_not_race_fresh_start_before_pid_is_recorded(tmp_path):
     assert overview["models"]["almaz"]["state"] == "starting"
 
 
+def test_windows_worker_claims_real_pid_from_verified_venv_launcher(
+    tmp_path, monkeypatch
+):
+    project = _make_project(tmp_path)
+    paths = jobs._paths(project)
+    job_id = "8" * 32
+    spec = jobs._model_spec(
+        "nova",
+        paths,
+        sys.executable,
+        paths.snapshot_dir / f"{job_id}.db",
+    )
+    launcher_pid = 10101
+    worker_pid = 20202
+    tokens = {
+        launcher_pid: "win:launcher",
+        worker_pid: "win:worker",
+    }
+
+    def install(payload):
+        payload["models"]["nova"] = jobs._new_job(
+            "nova", job_id, spec, project
+        )
+        payload["models"]["nova"].update(
+            {
+                "worker_pid": launcher_pid,
+                "worker_start_token": tokens[launcher_pid],
+            }
+        )
+        payload["active_job_id"] = job_id
+
+    jobs._mutate_state(paths, install)
+    monkeypatch.setattr(jobs.portable_os, "IS_WINDOWS", True)
+    monkeypatch.setattr(jobs.os, "getpid", lambda: worker_pid)
+    monkeypatch.setattr(jobs.os, "getppid", lambda: launcher_pid)
+    monkeypatch.setattr(jobs, "_process_start_token", tokens.get)
+
+    assert jobs._claim_worker_identity(paths, "nova", job_id) is True
+    with jobs._locked_state(paths):
+        state = jobs._read_state_unlocked(paths)
+    assert state["models"]["nova"]["worker_pid"] == worker_pid
+    assert state["models"]["nova"]["worker_start_token"] == tokens[worker_pid]
+
+
 def test_cancel_refuses_unverified_or_reused_pid(tmp_path, monkeypatch):
     paths, job_id = _install_job(
         _make_project(tmp_path), pid=os.getpid()
@@ -401,7 +498,10 @@ def test_cancel_removes_matching_pending_activation(tmp_path, monkeypatch):
     )
 
     assert status["state"] == "cancelling"
-    assert signalled == [(os.getpid(), jobs.signal.SIGTERM)]
+    if os.name == "nt":
+        assert signalled == []
+    else:
+        assert signalled == [(os.getpid(), jobs.signal.SIGTERM)]
     assert not (
         project / ".run" / "model_training" / "pending" / "almaz.json"
     ).exists()
@@ -444,6 +544,7 @@ def test_model_commands_are_fixed_staging_only_and_use_reserved_holdout(tmp_path
     almaz = jobs._model_spec("almaz", paths, sys.executable, snapshot)
     igor = jobs._model_spec("igor", paths, sys.executable, snapshot)
     nova = jobs._model_spec("nova", paths, sys.executable, snapshot)
+    vega = jobs._model_spec("vega", paths, sys.executable, snapshot)
     knives = jobs._model_spec("knives", paths, sys.executable, snapshot)
     gloves = jobs._model_spec("gloves", paths, sys.executable, snapshot)
 
@@ -453,6 +554,15 @@ def test_model_commands_are_fixed_staging_only_and_use_reserved_holdout(tmp_path
         assert "--test-rows" in spec.command
         index = spec.command.index("--test-rows")
         assert spec.command[index + 1] == "5000"
+    assert vega.candidate_dir.is_relative_to(project)
+    assert "artifacts" not in vega.candidate_dir.parts
+    assert vega.command[vega.command.index("--test-rows") + 1] == "25000"
+    assert vega.command[vega.command.index("--epochs") + 1] == "20"
+    assert vega.required_files == (
+        "vega_price_model.pt",
+        "vega_metadata.json",
+        "vega_metrics.json",
+    )
     assert "--progress" in almaz.command
     assert "--progress" in knives.command
     assert knives.required_files == (
@@ -477,7 +587,7 @@ def test_model_commands_are_fixed_staging_only_and_use_reserved_holdout(tmp_path
 def test_model_command_preserves_virtualenv_launcher_symlink(tmp_path):
     project = _make_project(tmp_path)
     launcher = project / "venv-python"
-    launcher.symlink_to(sys.executable)
+    _symlink_or_skip(launcher, sys.executable)
     paths = jobs._paths(project)
 
     spec = jobs._model_spec(
@@ -658,6 +768,40 @@ def test_gloves_bootstrap_eligibility_uses_dedicated_isolated_thresholds(tmp_pat
     }
 
 
+def test_vega_bootstrap_requires_large_weapon_holdout_and_runtime_population(
+    tmp_path,
+):
+    project = _make_project(tmp_path)
+
+    blocked = jobs.get_model_training_eligibility(
+        "vega",
+        project_dir=project,
+        _database_counts=(
+            jobs.VEGA_BOOTSTRAP_MIN_ROWS,
+            jobs.VEGA_BOOTSTRAP_MIN_RUNTIME_VALID_ROWS - 1,
+        ),
+    )
+    ready = jobs.get_model_training_eligibility(
+        "vega",
+        project_dir=project,
+        _database_counts=(
+            jobs.VEGA_BOOTSTRAP_MIN_ROWS,
+            jobs.VEGA_BOOTSTRAP_MIN_RUNTIME_VALID_ROWS,
+        ),
+    )
+
+    assert blocked["bootstrap"] is True
+    assert blocked["item_kind"] == "weapon_skin"
+    assert "production_metrics_missing" not in blocked["reasons"]
+    assert "not_enough_runtime_valid_rows" in blocked["reasons"]
+    assert ready["eligible"] is True
+    assert ready["thresholds"] == {
+        "min_new_rows": 100_000,
+        "min_growth_percent": jobs.MIN_DATA_GROWTH_PERCENT,
+        "min_runtime_valid_new_rows": 100_000,
+    }
+
+
 def test_eligibility_rejects_explicit_cross_kind_or_corrupt_source_provenance(
     tmp_path, monkeypatch
 ):
@@ -802,6 +946,7 @@ def test_strict_eligibility_never_counts_unknown_as_weapon_skin(tmp_path, monkey
     assert result["almaz"]["current_rows"] == 1
     assert result["igor"]["current_rows"] == 1
     assert result["nova"]["current_rows"] == 1
+    assert result["vega"]["current_rows"] == 1
     assert result["knives"]["current_rows"] == 1
     assert result["gloves"]["current_rows"] == 1
 
@@ -870,7 +1015,7 @@ def test_all_model_eligibility_shares_one_consistent_database_snapshot(
 
     result = jobs.get_all_training_eligibility(project_dir=project)
 
-    for model in ("almaz", "igor", "nova"):
+    for model in ("almaz", "igor", "nova", "vega"):
         assert result[model]["current_rows"] == 3
         assert result[model]["new_rows"] == 2
         assert result[model]["runtime_valid_new_rows"] == 2
@@ -951,8 +1096,11 @@ def test_sqlite_snapshot_is_private_immutable_and_point_in_time(tmp_path, monkey
         connection.execute("INSERT INTO sales VALUES ('sold', 200, 'two')")
 
     assert rows == 1
-    assert _mode(snapshot) == 0o400
-    with sqlite3.connect(f"{snapshot.resolve().as_uri()}?mode=ro", uri=True) as connection:
+    if os.name != "nt":
+        assert _mode(snapshot) == 0o400
+    with closing(
+        sqlite3.connect(f"{snapshot.resolve().as_uri()}?mode=ro", uri=True)
+    ) as connection:
         assert connection.execute("SELECT COUNT(*) FROM sales").fetchone()[0] == 1
     jobs._delete_snapshot(paths, job_id)
     assert not snapshot.exists()
@@ -1016,7 +1164,11 @@ def test_start_uses_list_argv_no_shell_and_inherits_lock(tmp_path, monkeypatch):
 
     assert isinstance(captured["command"], list)
     assert captured["kwargs"]["shell"] is False
-    assert captured["kwargs"]["pass_fds"]
+    if os.name == "nt":
+        assert "pass_fds" not in captured["kwargs"]
+        assert captured["kwargs"]["creationflags"]
+    else:
+        assert captured["kwargs"]["pass_fds"]
     assert result["state"] == "starting"
     assert result["promotion_allowed"] is False
 
@@ -1546,7 +1698,11 @@ def test_candidate_retention_refuses_nested_symlink(tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "keep.txt").write_text("keep", encoding="utf-8")
-    (candidate / "escape").symlink_to(outside)
+    _symlink_or_skip(
+        candidate / "escape",
+        outside,
+        target_is_directory=True,
+    )
 
     with pytest.raises(jobs.TrainingJobError, match="unsafe entry"):
         jobs.cleanup_training_candidates(project_dir=project)

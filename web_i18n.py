@@ -339,10 +339,31 @@ def _bootstrap(locale: str) -> str:
       }}
       const compiledPatterns = patternTemplates.map(pair => compileTemplate(pair[0], pair[1])).filter(Boolean);
 
+      // Pages re-render hundreds of rows; most text nodes repeat or have no
+      // translation.  Memoising the lookup avoids running every compiled
+      // pattern again for each identical miss.
+      const memo = new Map();
+      const MEMO_LIMIT = 6000;
       function translated(value, depth = 0) {{
         const source = String(value ?? '');
         const trimmed = source.trim();
         if (!trimmed) return source;
+        if (depth === 0 && memo.has(trimmed)) {{
+          const cached = memo.get(trimmed);
+          if (!cached) return source;
+          const leading = source.slice(0, source.indexOf(trimmed));
+          return `${{leading}}${{cached}}${{source.slice(leading.length + trimmed.length)}}`;
+        }}
+        const result = translatedUncached(source, trimmed, depth);
+        if (depth === 0) {{
+          if (memo.size >= MEMO_LIMIT) memo.clear();
+          const resultTrimmed = result.trim();
+          memo.set(trimmed, resultTrimmed !== trimmed ? resultTrimmed : null);
+        }}
+        return result;
+      }}
+
+      function translatedUncached(source, trimmed, depth) {{
         let target = translations[trimmed];
         if (!target) {{
           for (const pattern of compiledPatterns) {{

@@ -72,6 +72,9 @@ def profile_settings(
         "selection_mode": str(raw.get("selection_mode") or ""),
         "include": list(raw.get("include") or []),
         "exclude": list(raw.get("exclude") or []),
+        "targets_per_cycle": raw.get("targets_per_cycle"),
+        "listings_per_target": raw.get("listings_per_target"),
+        "include_groups": list(raw.get("include_groups") or []),
     }
 
 
@@ -94,11 +97,11 @@ def apply_profile_selection(
     *,
     recommended_limit: int | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Apply manual overrides while preserving the configured local pool cap.
+    """Select manual targets and groups before capped recommendations.
 
-    Manual includes have priority over algorithmic recommendations.  The
-    resulting pool is capped by ``recommended_limit`` when it is an integer;
-    per-cycle request/listing/page budgets remain a separate scanner concern.
+    ``recommended_limit`` caps only additional algorithmic recommendations;
+    manual targets and included groups remain selected above that cap.
+    Per-cycle request/listing/page budgets remain a separate scanner concern.
     ``None`` is used for catalog rotations (knives/gloves), whose durable
     windows provide the local cap while eventually covering the whole catalog.
     """
@@ -119,23 +122,35 @@ def apply_profile_selection(
         selected_keys.add(key)
         selected.append(by_key[key])
 
+    automatic_candidates = 0
+    automatic_truncated = False
     if settings["enabled"]:
         for key in include:
             append_key(key)
+        for row in rows:
+            if row.get("group_included") is True:
+                append_key(str(row["target_key"]))
         if settings["selection_mode"] == "recommended":
             for row in rows:
-                if row.get("recommended_candidate", True) is True:
-                    append_key(str(row["target_key"]))
+                if row.get("recommended_candidate", True) is not True:
+                    continue
+                key = str(row["target_key"])
+                if key in selected_keys or key in excluded or key not in by_key:
+                    continue
+                if (
+                    recommended_limit is not None
+                    and automatic_candidates >= int(recommended_limit)
+                ):
+                    automatic_truncated = True
+                    continue
+                append_key(key)
+                automatic_candidates += 1
 
     configured_cap = None
-    truncated = False
     if recommended_limit is not None:
         if isinstance(recommended_limit, bool) or int(recommended_limit) < 1:
             raise ValueError("recommended_limit must be a positive integer or null")
         configured_cap = int(recommended_limit)
-        truncated = len(selected) > configured_cap
-        selected = selected[:configured_cap]
-        selected_keys = {str(row["target_key"]) for row in selected}
 
     return selected, {
         "enabled": settings["enabled"],
@@ -146,9 +161,10 @@ def apply_profile_selection(
         ),
         "selected_count": len(selected),
         "configured_pool_cap": configured_cap,
-        "selection_truncated": truncated,
+        "selection_truncated": automatic_truncated,
         "manual_include_count": len(include),
         "manual_exclude_count": len(excluded),
+        "included_group_count": len(settings.get("include_groups") or []),
         "unresolved_include": unresolved,
         "selected_target_keys": selected_keys,
     }

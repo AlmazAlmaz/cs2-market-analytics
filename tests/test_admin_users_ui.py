@@ -85,6 +85,7 @@ def test_page_covers_search_filters_summary_and_live_activity():
         "metricApproved",
         "metricBlocked",
         "metricOnline",
+        "metricDownloading",
         "usersList",
     ):
         assert f'id="{element_id}"' in page
@@ -94,11 +95,32 @@ def test_page_covers_search_filters_summary_and_live_activity():
 
     assert "const ONLINE_WINDOW_SECONDS=300" in page
     assert "window.setInterval" in page
-    assert "20000" in page
+    assert "window.setInterval(refreshVisibleUsers,2000)" in page
     assert "last_seen_at" in page
     assert "last_login_at" in page
     assert "active_sessions" in page
     assert "recent_sessions" in page
+
+
+def test_page_displays_database_downloads_and_separate_access_key_history():
+    page = admin_users_ui.render_admin_users_page()
+
+    for field in (
+        "database_downloads", "unattributed_downloads", "active_count",
+        "total_bytes", "completed_count", "bytes_sent", "filename",
+        "started_at", "updated_at", "finished_at", "ip_address",
+    ):
+        assert field in page
+    assert 'id="keyDownloadsPanel"' in page
+    assert 'value="downloading" data-i18n="downloadingOnly"' in page
+    assert "Скачивания по ключу доступа" in page
+    assert "Downloads using an access key" in page
+    assert "Скачивания до включения учёта недоступны" in page
+    assert "including partial downloads" in page
+    assert "may differ from the file saved on the device" in page
+    assert "document.addEventListener('visibilitychange',refreshVisibleUsers)" in page
+    assert "if(loadingPromise)return loadingPromise" in page
+    assert "rememberDetails(target)" in page
 
 
 def test_page_displays_sanitized_network_security_and_account_metadata():
@@ -219,8 +241,100 @@ def test_inline_browser_program_has_valid_javascript():
         [node, "--check"],
         input=match.group(1),
         text=True,
+        encoding="utf-8",
         capture_output=True,
         check=False,
     )
 
+    assert result.returncode == 0, result.stderr
+
+
+def test_download_rendering_filter_refresh_and_preserved_controls_in_javascript():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    match = re.search(
+        r"<script>(.*?)</script>", admin_users_ui.render_admin_users_page("en"), re.DOTALL
+    )
+    assert match
+    program = match.group(1).split("    locale=storedLocale();", 1)[0]
+    harness = r"""
+const assert=require('node:assert/strict');
+class Element {
+  constructor(tag='div'){this.tagName=tag.toUpperCase();this.children=[];this.dataset={};this.attributes={};this.className='';this.value='';this.open=false;this._text=''}
+  set textContent(value){this._text=String(value);this.children=[]}
+  get textContent(){return this._text+this.children.map(child=>child.textContent).join('')}
+  appendChild(child){child.parentElement=this;this.children.push(child);return child}
+  replaceChildren(){this.children=[];this._text=''}
+  setAttribute(key,value){this.attributes[key]=String(value)}
+  addEventListener(){}
+  matches(selector){if(selector==='details[data-detail-key]')return this.tagName==='DETAILS'&&this.dataset.detailKey!==undefined;if(selector==='[data-action]')return this.dataset.action!==undefined;if(selector.startsWith('.'))return this.className.split(' ').includes(selector.slice(1));return this.tagName===selector.toUpperCase()}
+  querySelectorAll(selector){return this.children.flatMap(child=>[...(child.matches(selector)?[child]:[]),...child.querySelectorAll(selector)])}
+  querySelector(selector){return this.querySelectorAll(selector)[0]||null}
+  closest(selector){return this.matches(selector)?this:this.parentElement?.closest(selector)||null}
+  focus(){document.activeElement=this}
+}
+const elements=new Map();
+const document={activeElement:null,visibilityState:'visible',cookie:'',documentElement:{},addEventListener(){},querySelectorAll(){return []},getElementById(id){if(!elements.has(id))elements.set(id,new Element());return elements.get(id)},createElement:tag=>new Element(tag),createTextNode:value=>{const node=new Element('#text');node.textContent=value;return node}};
+const window={};
+const localStorage={getItem(){return ''}};
+const location={origin:'http://localhost',protocol:'http:'};
+const fetchRequests=[];
+const fetch=()=>new Promise(resolve=>fetchRequests.push(resolve));
+"""
+    assertions = r"""
+(async()=>{
+  byId('activityFilter').value='all';byId('sortSelect').value='seen';
+  const base={id:12,status:'downloading',bytes_sent:512,total_bytes:1024,filename:'<img src=x onerror=alert(1)>.sqlite',ip_address:'192.0.2.7',started_at:'2026-09-30T10:00:00Z',updated_at:'2026-09-30T10:01:00Z'};
+  const row=downloadRow(base);
+  assert.match(row.textContent,/Transferred 512 B of 1 KiB · 50%/);
+  assert.match(row.textContent,/192\.0\.2\.7/);
+  assert.match(row.textContent,/<img src=x onerror=alert\(1\)>/);
+  assert.equal(row.querySelector('img'),null);
+  assert.equal(row.querySelector('progress').value,50);
+  assert.match(row.querySelector('progress').attributes['aria-label'],/Database transfer/);
+  const preparing=downloadRow({...base,status:'preparing',total_bytes:null,bytes_sent:0});
+  assert.match(preparing.textContent,/Preparing file/);
+  assert.equal(preparing.querySelector('progress').value,'');
+  const empty=downloadRow({...base,status:'completed',total_bytes:0,bytes_sent:0});
+  assert.match(empty.textContent,/Transferred 0 B of 0 B · 100%/);
+  for(const [status,label] of [['interrupted','Interrupted'],['failed','Failed'],['completed','Completed']])assert.match(downloadRow({...base,status}).textContent,new RegExp(label));
+  const first={id:'person-1',email:'first@example.test',access_status:'approved',is_online:false,database_downloads:{active_count:1,total_bytes:1536,completed_count:1,recent:[base,{...base,id:10,status:'completed'}]}};
+  const second={id:'person-2',email:'second@example.test',access_status:'approved',is_online:true,database_downloads:{active_count:0,total_bytes:0,completed_count:0,recent:[]}};
+  users=[first,second];unattributedDownloads={active_count:2,total_bytes:4096,completed_count:0,recent:[{...base,id:15,ip_address:'198.51.100.9'}]};
+  renderUsers();renderKeyDownloads();updateSummary();
+  assert.equal(byId('metricDownloading').textContent,'3');
+  assert.equal(byId('keyDownloadsPanel').hidden,false);
+  assert.match(byId('keyDownloadsList').textContent,/198\.51\.100\.9/);
+  assert.doesNotMatch(byId('usersList').textContent,/198\.51\.100\.9/);
+  assert.match(byId('usersList').textContent,/Total transferred, including partial downloads: 1.5 KiB/);
+  const details=byId('usersList').querySelectorAll('details');details.forEach(detail=>detail.open=true);
+  const control=byId('usersList').querySelector('[data-action]');control.focus();
+  first.database_downloads.recent[0]={...base,bytes_sent:768};renderUsers();
+  assert.equal(byId('usersList').querySelectorAll('details').every(detail=>detail.open),true);
+  assert.equal(document.activeElement.dataset.action,control.dataset.action);
+  assert.notEqual(document.activeElement,control);
+  assert.match(byId('usersList').textContent,/75%/);
+  byId('activityFilter').value='downloading';assert.deepEqual(filteredUsers().map(user=>user.id),['person-1']);
+  byId('activityFilter').value='offline';assert.deepEqual(filteredUsers().map(user=>user.id),['person-1']);
+  byId('activityFilter').value='online';assert.deepEqual(filteredUsers().map(user=>user.id),['person-2']);
+  byId('activityFilter').value='all';
+  applyLocale('ru');assert.match(byId('usersList').textContent,/Сейчас скачивает/);
+  assert.match(byId('usersList').textContent,/Передано 768 B из 1 KiB · 75%/);
+  const one=loadUsers({quiet:true}),two=loadUsers({quiet:true});
+  assert.equal(one,two);assert.equal(fetchRequests.length,1);
+  fetchRequests.shift()({ok:true,json:async()=>({users:[first,second],unattributed_downloads:unattributedDownloads,summary:{downloading:3}})});await one;
+  assert.equal(loadingPromise,null);assert.equal(byId('refreshButton').disabled,false);
+  document.visibilityState='hidden';refreshVisibleUsers();assert.equal(fetchRequests.length,0);
+  document.visibilityState='visible';pendingAction={action:'block',user:first};refreshVisibleUsers();assert.equal(fetchRequests.length,0);
+  pendingAction=null;byId('resetLinkDialog').open=true;refreshVisibleUsers();assert.equal(fetchRequests.length,0);
+  byId('resetLinkDialog').open=false;refreshVisibleUsers();refreshVisibleUsers();assert.equal(fetchRequests.length,1);
+  const pending=loadingPromise;fetchRequests.shift()({ok:true,json:async()=>({users:[],unattributed_downloads:{}})});await pending;
+  assert.equal(byId('keyDownloadsPanel').hidden,true);
+})().catch(error=>{console.error(error);process.exitCode=1});
+"""
+    result = subprocess.run(
+        [node], input=harness + program + assertions,
+        text=True, encoding="utf-8", capture_output=True, check=False,
+    )
     assert result.returncode == 0, result.stderr

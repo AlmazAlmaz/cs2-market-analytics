@@ -162,6 +162,19 @@ def test_scanner_targets_route_is_admin_only_and_returns_bounded_contract(
             "max_excluded_targets": scanner_control.MAX_EXCLUDED_TARGETS,
             "max_target_key_length": scanner_control.MAX_TARGET_KEY_LENGTH,
             "max_request_body_bytes": scanner_control.TARGET_CONTROL_BODY_LIMIT,
+            "targets_per_cycle": {
+                "sticker_guns": {"min": 1, "max": 250, "default": 5},
+                "liquid_under_10": {"min": 1, "max": 25, "default": 2},
+                "knives": {"min": 1, "max": 10, "default": 1},
+                "gloves": {"min": 1, "max": 10, "default": 1},
+            },
+            "listings_per_target": {
+                "sticker_guns": {"min": 1, "max": 50, "default": 50},
+                "liquid_under_10": {"min": 1, "max": 25, "default": 20},
+                "knives": {"min": 1, "max": 20, "default": 10},
+                "gloves": {"min": 1, "max": 20, "default": 10},
+            },
+            "max_included_groups": scanner_control.MAX_INCLUDED_GROUPS,
         }
 
 

@@ -1,3 +1,4 @@
+import gzip
 import html
 import ipaddress
 import json
@@ -24,8 +25,8 @@ import app_config
 import catalog_browser
 import csfloat_listing_fetcher
 import deal_intelligence
-import inventory_market
 import inventory_item_catalog
+import inventory_market
 import knives_dashboard
 import listing_search
 import market_analytics
@@ -33,14 +34,17 @@ import market_history_dashboard
 import model_generations
 import model_lifecycle
 import model_training_jobs
+import portable_os
 import scanner_control
 import scanner_target_catalog
 import web_i18n
+import web_theme
 from item_classification import (
     ITEM_KIND_GLOVE,
     ITEM_KIND_KNIFE,
     ITEM_KIND_WEAPON_SKIN,
     classify_market_hash_name,
+    classify_name_fallback,
     sql_item_kind_expression,
 )
 from TRENDMODEL.api import (
@@ -82,6 +86,8 @@ ACCOUNT_TRUST_CF_COUNTRY = app_config.get_bool(
 )
 ACCOUNT_BODY_LIMIT = 64 * 1024
 ADMIN_USERS_BODY_LIMIT = 16 * 1024
+DATABASE_DOWNLOAD_CHUNK_BYTES = 256 * 1024
+DATABASE_DOWNLOAD_PROGRESS_INTERVAL = 1.0
 ACCOUNT_SESSION_COOKIE = "cs2_session"
 ACCOUNT_CSRF_COOKIE = "cs2_csrf"
 ACCOUNT_ITEM_SEARCH_LIMIT = 20
@@ -98,7 +104,15 @@ PROGRESS_ID = 2
 STEAM_MARKET_BASE_URL = "https://steamcommunity.com/market/listings/730/"
 CSFLOAT_SCREENSHOT_BASE_URL = "https://s.csfloat.com/m"
 DASHBOARD_STATIC_CACHE_TTL_SECONDS = 300
+# Full-table COUNT/GROUP BY over the multi-GB sales table takes tens of
+# seconds.  The admin page polls every LIVE_REFRESH_MS, so those aggregates are
+# served stale-while-revalidate instead of being recomputed per request.
+DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 90
+DASHBOARD_HEAVY_WAIT_SECONDS = 2.0
 DETAIL_CACHE_TTL_SECONDS = 120
+# Text responses smaller than one TCP segment gain nothing from compression.
+GZIP_MIN_BYTES = 1400
+GZIP_COMPRESS_LEVEL = 5
 LIVE_REFRESH_MS = 10000
 # A listing fetch can try several 30-second routes synchronously.  PID liveness
 # still detects a stopped process immediately; this threshold only separates a
@@ -122,6 +136,8 @@ TARGET_NEW_SALES_PER_REQUEST = app_config.get_int(
 )
 DEAL_POSITIVE_VERDICTS = frozenset({"good", "watch"})
 DEAL_MODEL_NAMES = frozenset({"almaz", "igor", "nova"})
+DEAL_ADVISORY_MODEL_NAMES = frozenset({"vega"})
+WEAPON_SKIN_MODEL_NAMES = DEAL_MODEL_NAMES | DEAL_ADVISORY_MODEL_NAMES
 DEFAULT_DEAL_OPINION_STALE_HOURS = 24
 MAX_SAFE_PAGE_OFFSET = 9_007_199_254_740_991
 DEAL_CONFIDENCE_FILTERS = frozenset({
@@ -1736,7 +1752,7 @@ HTML = r"""<!doctype html>
         <h2>Model Freshness &amp; Quality</h2>
         <span class="pill" id="modelFreshnessInfo">compared with current DB</span>
       </div>
-      <p class="model-isolation-note">Almaz, Igor and Nova use weapon skins only. Knives and gloves have isolated data, artifacts and quality gates.</p>
+      <p class="model-isolation-note">Almaz, Igor, Nova and advisory Vega use weapon skins only. Knives and gloves have isolated data, artifacts and quality gates.</p>
       <div class="model-health-grid" id="modelHealthCards">
         <div class="muted">loading model artifacts</div>
       </div>
@@ -1768,12 +1784,12 @@ HTML = r"""<!doctype html>
             <label for="scannerIntervalMinutes">
               <span>Интервал между началами циклов</span>
               <span class="scanner-interval-input">
-                <input id="scannerIntervalMinutes" type="number" min="1" max="1440" step="1" inputmode="numeric" value="10" list="scannerIntervalPresets" disabled>
+                <input id="scannerIntervalMinutes" type="number" min="0" max="1440" step="1" inputmode="numeric" value="10" list="scannerIntervalPresets" disabled>
                 <span>мин</span>
               </span>
             </label>
             <datalist id="scannerIntervalPresets">
-              <option value="1"></option><option value="5"></option><option value="10"></option>
+              <option value="0"></option><option value="1"></option><option value="5"></option><option value="10"></option>
               <option value="15"></option><option value="30"></option><option value="60"></option>
             </datalist>
             <div class="scanner-action-row">
@@ -1781,6 +1797,7 @@ HTML = r"""<!doctype html>
               <button class="button button-primary" id="scannerToggleButton" type="button" disabled>Загрузка…</button>
             </div>
             <span class="scanner-feedback" id="scannerControlFeedback" role="status" aria-live="polite">Изменения применяются без перезапуска.</span>
+            <small class="scanner-control-help">0 минут — новый цикл начнётся сразу после завершения текущего.</small>
           </div>
         </div>
         <div class="scanner-target-shell">
@@ -1806,10 +1823,29 @@ HTML = r"""<!doctype html>
             <div class="scanner-target-toolbar">
               <label><span>Режим</span><select id="scannerTargetMode"><option value="recommended">Рекомендованные</option><option value="custom">Свой список</option></select></label>
               <label class="scanner-target-enabled"><input id="scannerTargetEnabled" type="checkbox"><span>Профиль включён</span></label>
-              <label class="scanner-target-search"><span>Поиск по точному названию</span><input id="scannerTargetSearch" maxlength="160" placeholder="Название скина, ножа или наклейки"></label>
+              <label><span>Целей за цикл</span><input id="scannerTargetsPerCycle" type="number" min="1" step="1" inputmode="numeric"></label>
+              <label><span>Скинов на цель</span><input id="scannerListingsPerTarget" type="number" min="1" step="1" inputmode="numeric"></label>
+              <label class="scanner-target-search"><span>Поиск по названию</span><input id="scannerTargetSearch" type="search" maxlength="160" placeholder="Название скина, ножа или наклейки"></label>
               <button class="button" id="scannerTargetSearchButton" type="button">Найти</button>
             </div>
+            <div class="scanner-sticker-groups" id="scannerStickerGroups" hidden>
+              <label><span>Группа наклеек</span><select id="scannerStickerGroupSelect"></select></label>
+              <button class="button" id="scannerStickerGroupAdd" type="button">Добавить всю группу</button>
+              <button class="button" id="scannerStickerGroupRemove" type="button">Убрать группу</button>
+              <button class="button" id="scannerStickerKatoPreset" type="button">Все Katowice 2014 + 2015</button>
+              <div class="scanner-sticker-group-chips" id="scannerStickerGroupChips"></div>
+              <small>Группа хранится по названию турнира: новые найденные наклейки попадут в ротацию автоматически. Отдельные галочки ниже работают как исключения.</small>
+            </div>
             <div class="scanner-target-summary" id="scannerTargetSummary"></div>
+            <div class="scanner-selection-toolbar">
+              <span class="muted">На этой странице</span>
+              <div class="scanner-selection-tabs" id="scannerSelectionTabs" role="group" aria-label="Показать цели">
+                <button type="button" class="filter-chip active" data-target-view="all" aria-pressed="true">Все <b id="scannerVisibleAll">0</b></button>
+                <button type="button" class="filter-chip" data-target-view="selected" aria-pressed="false">Выбраны <b id="scannerVisibleSelected">0</b></button>
+                <button type="button" class="filter-chip" data-target-view="unselected" aria-pressed="false">Не выбраны <b id="scannerVisibleUnselected">0</b></button>
+              </div>
+              <span class="scanner-selection-hint">Нажми на название, чтобы выбрать цель</span>
+            </div>
             <div class="scanner-target-bulk">
               <button class="button" id="scannerTargetSelectVisible" type="button">Выбрать показанные</button>
               <button class="button" id="scannerTargetClearVisible" type="button">Убрать показанные</button>
@@ -2325,6 +2361,7 @@ HTML = r"""<!doctype html>
     let scannerTargetPreview = null;
     let scannerTargetProfile = 'sticker_guns';
     let scannerTargetOffset = 0;
+    let scannerTargetView = 'all';
     const scannerTargetLimit = 50;
     let scannerTargetBusy = false;
     let scannerTargetGeneration = 0;
@@ -2356,7 +2393,7 @@ HTML = r"""<!doctype html>
         description: 'Цели уже можно выбрать, но сетевые запросы останутся заблокированы, пока не появится проверенная отдельная модель перчаток.',
       },
     });
-    const TRAINABLE_MODEL_NAMES = Object.freeze(['almaz', 'igor', 'nova', 'knives', 'gloves']);
+    const TRAINABLE_MODEL_NAMES = Object.freeze(['almaz', 'igor', 'nova', 'vega', 'knives', 'gloves']);
     const MODEL_TRAINING_ACTIVE_STATES = new Set(['starting', 'running', 'cancelling']);
     const TRAINING_UI_COPY = Object.freeze({
       ru: {
@@ -2607,7 +2644,7 @@ HTML = r"""<!doctype html>
       text('scannerCycleResult', `${scanned}/${total} целей · ${listings} лотов · ${saved} сохранено`);
 
       if (document.activeElement !== intervalInput && intervalInput.dataset.dirty !== 'true') {
-        const minutes = Number(control.interval_seconds || 600) / 60;
+        const minutes = Number(control.interval_seconds ?? 600) / 60;
         intervalInput.value = Number(minutes.toFixed(2));
       }
       intervalInput.disabled = scannerControlBusy || controlError;
@@ -2632,7 +2669,12 @@ HTML = r"""<!doctype html>
       } else if (!runtime.online) {
         setScannerFeedback('Поиск включён, но процесс не запущен. Запусти проект командой ./start_all.sh.', 'bad');
       } else {
-        setScannerFeedback(`Интервал ${seconds(control.interval_seconds)} применяется без перезапуска.`, 'good');
+        setScannerFeedback(
+          Number(control.interval_seconds) === 0
+            ? 'Циклы запускаются подряд без ожидания между ними.'
+            : `Интервал ${seconds(control.interval_seconds)} применяется без перезапуска.`,
+          'good',
+        );
       }
     }
 
@@ -2717,6 +2759,9 @@ HTML = r"""<!doctype html>
           selection_mode: saved.selection_mode || 'recommended',
           include: Array.from(new Set(saved.include || [])),
           exclude: Array.from(new Set(saved.exclude || [])),
+          include_groups: Array.from(new Set(saved.include_groups || [])),
+          targets_per_cycle: Number(saved.targets_per_cycle || 1),
+          listings_per_target: Number(saved.listings_per_target || 1),
           dirty: false,
         });
       }
@@ -2744,13 +2789,19 @@ HTML = r"""<!doctype html>
       const key = String(item.target_key || '');
       if (exclude.has(key)) return false;
       if (include.has(key)) return true;
-      return mode === 'recommended' && Boolean(item.recommended);
+      return Boolean(item.group_included) || (mode === 'recommended' && Boolean(item.recommended));
+    }
+
+    function scannerTargetWithDraftGroup(item, draft) {
+      const parts = String(item.name || '').split(' | ').map(part => part.trim());
+      const groupIncluded = parts.length >= 3 && (draft?.include_groups || []).includes(parts[parts.length - 1]);
+      return { ...item, group_included: groupIncluded };
     }
 
     function scannerTargetSelected(item, draft) {
       if (!draft?.dirty) return Boolean(item.selected);
       return scannerTargetSelectedWithOverrides(
-        item,
+        scannerTargetWithDraftGroup(item, draft),
         draft?.selection_mode,
         new Set(draft?.include || []),
         new Set(draft?.exclude || []),
@@ -2764,7 +2815,8 @@ HTML = r"""<!doctype html>
         include.add(key);
       } else {
         include.delete(key);
-        if (mode === 'recommended') exclude.add(key);
+        // A custom tournament group can select the item again unless it has an explicit exclusion.
+        if (mode === 'recommended' || item.group_included) exclude.add(key);
       }
     }
 
@@ -2778,11 +2830,13 @@ HTML = r"""<!doctype html>
         const mode = draft.selection_mode === 'custom' ? 'свой список' : 'рекомендованные';
         const state = draft.enabled ? 'включён' : 'выключен';
         const tone = draft.enabled ? 'good' : 'warn';
-        const changed = draft.dirty ? ' · не сохранено' : '';
-        return `<button class="scanner-profile-card${profile === scannerTargetProfile ? ' active' : ''}" type="button" data-scanner-profile="${escapeHtml(profile)}" ${scannerTargetBusy ? 'disabled' : ''}>
-          <span class="scanner-profile-card-head"><strong>${escapeHtml(copy.title)}</strong><span class="status"><span class="dot ${tone}"></span>${state}</span></span>
+      const changed = draft.dirty ? scannerUiText('не сохранено') : '';
+        const symbols = { sticker_guns: '▧', liquid_under_10: '$', knives: '◇', gloves: '◈' };
+        return `<button class="scanner-profile-card${profile === scannerTargetProfile ? ' active' : ''}" type="button" aria-pressed="${profile === scannerTargetProfile}" data-scanner-profile="${escapeHtml(profile)}" ${scannerTargetBusy ? 'disabled' : ''}>
+          <span class="scanner-profile-symbol" aria-hidden="true">${symbols[profile] || '◎'}</span>
+          <span class="scanner-profile-card-head"><strong>${escapeHtml(copy.title)}</strong><span class="status"><span class="dot ${tone}"></span><span>${scannerUiText(state)}</span></span></span>
           <p>${escapeHtml(copy.short)}</p>
-          <span class="scanner-profile-card-foot"><span>${mode}</span><span>+${(draft.include || []).length} вручную</span><span>−${(draft.exclude || []).length}${changed}</span></span>
+          <span class="scanner-profile-card-foot"><span>${mode}</span><span>${fmt.format(draft.targets_per_cycle || 0)} ${scannerUiText('целей за цикл')}</span><span>${changed}</span></span>
         </button>`;
       }).join('');
     }
@@ -2805,11 +2859,13 @@ HTML = r"""<!doctype html>
       if (draft?.dirty) {
         if ((draft.include || []).includes(key)) return 'добавлено вручную';
         if ((draft.exclude || []).includes(key)) return 'исключено вручную';
+        if (scannerTargetWithDraftGroup(item, draft).group_included) return 'выбранная группа наклеек';
         if (item.recommended_candidate || item.recommended) return 'рекомендация по локальным данным';
         return 'найдено по вашему поиску';
       }
       if (item.manually_included) return 'добавлено вручную';
       if (item.excluded) return 'исключено вручную';
+      if (item.group_included) return 'выбранная группа наклеек';
       if (item.recommended_candidate || item.recommended) return 'рекомендация по локальным данным';
       return 'найдено по вашему поиску';
     }
@@ -2826,13 +2882,48 @@ HTML = r"""<!doctype html>
       text('scannerTargetEyebrow', String(scannerTargetProfile).toUpperCase());
       const modeInput = document.getElementById('scannerTargetMode');
       const enabledInput = document.getElementById('scannerTargetEnabled');
+      const targetsInput = document.getElementById('scannerTargetsPerCycle');
+      const listingsInput = document.getElementById('scannerListingsPerTarget');
       modeInput.value = draft.selection_mode;
       modeInput.disabled = scannerTargetBusy;
       enabledInput.checked = draft.enabled;
       enabledInput.disabled = scannerTargetBusy;
+      const targetLimits = scannerTargetsPayload?.limits?.targets_per_cycle?.[scannerTargetProfile] || {};
+      const listingLimits = scannerTargetsPayload?.limits?.listings_per_target?.[scannerTargetProfile] || {};
+      targetsInput.min = String(targetLimits.min || 1);
+      targetsInput.max = String(targetLimits.max || 250);
+      targetsInput.value = String(draft.targets_per_cycle || targetLimits.default || 1);
+      targetsInput.disabled = scannerTargetBusy;
+      listingsInput.min = String(listingLimits.min || 1);
+      listingsInput.max = String(listingLimits.max || 50);
+      listingsInput.value = String(draft.listings_per_target || listingLimits.default || 1);
+      listingsInput.disabled = scannerTargetBusy;
       document.getElementById('scannerTargetSearch').disabled = scannerTargetBusy;
       document.getElementById('scannerTargetSearchButton').disabled = scannerTargetBusy;
       document.getElementById('scannerTargetsRefresh').disabled = scannerTargetBusy;
+
+      const groupPanel = document.getElementById('scannerStickerGroups');
+      groupPanel.hidden = scannerTargetProfile !== 'sticker_guns';
+      if (scannerTargetProfile === 'sticker_guns') {
+        const groups = Array.isArray(preview.groups) ? [...preview.groups] : [];
+        const priority = name => name === 'Katowice 2014' ? 0 : name === 'Katowice 2015' ? 1 : 2;
+        groups.sort((a, b) => priority(a.name) - priority(b.name) || String(a.name).localeCompare(String(b.name)));
+        const select = document.getElementById('scannerStickerGroupSelect');
+        const previous = select.value;
+        select.innerHTML = groups.map(group =>
+          `<option value="${escapeHtml(group.name)}">${escapeHtml(group.name)} · ${fmt.format(group.target_count || 0)}</option>`
+        ).join('');
+        if (groups.some(group => group.name === previous)) select.value = previous;
+        const chosenGroups = draft.include_groups || [];
+        document.getElementById('scannerStickerGroupChips').innerHTML = chosenGroups.length
+          ? chosenGroups.map(name => `<button type="button" class="filter-chip active" data-remove-scanner-group="${escapeHtml(name)}" ${scannerTargetBusy ? 'disabled' : ''} aria-label="${escapeHtml(scannerUiText('Убрать группу'))}: ${escapeHtml(name)}">${escapeHtml(name)} <span aria-hidden="true">×</span></button>`).join('')
+          : '<span class="muted">Группы ещё не выбраны</span>';
+        select.disabled = scannerTargetBusy || !groups.length;
+        document.getElementById('scannerStickerGroupAdd').disabled = scannerTargetBusy || !groups.length;
+        document.getElementById('scannerStickerGroupRemove').disabled = scannerTargetBusy || !groups.length;
+        document.getElementById('scannerStickerKatoPreset').disabled = scannerTargetBusy ||
+          !['Katowice 2014', 'Katowice 2015'].every(name => groups.some(group => group.name === name));
+      }
 
       const readiness = document.getElementById('scannerTargetReadiness');
       const blocked = preview.blocked_reason;
@@ -2842,9 +2933,7 @@ HTML = r"""<!doctype html>
       const readinessTone = preview.scan_ready
         ? 'good'
         : (blocked === 'profile_disabled' ? 'warn' : 'bad');
-      readiness.textContent = draft.dirty
-        ? `${readinessText} · ${scannerUiText('не сохранено')}`
-        : readinessText;
+      readiness.innerHTML = `<span>${escapeHtml(readinessText)}</span>${draft.dirty ? ` · <span>${escapeHtml(scannerUiText('не сохранено'))}</span>` : ''}`;
       readiness.dataset.tone = draft.dirty && readinessTone === 'good'
         ? 'warn'
         : readinessTone;
@@ -2852,10 +2941,12 @@ HTML = r"""<!doctype html>
       const selection = preview.selection || {};
       const budget = preview.budget || {};
       const selectedCount = Number(selection.selected_count || 0);
-      const perCycle = Math.max(1, Number(budget.targets_per_cycle || 1));
+      const perCycle = Math.max(1, Number(draft.targets_per_cycle || budget.targets_per_cycle || 1));
       const cycles = Math.ceil(selectedCount / perCycle);
-      const interval = Number(scannerControlPayload?.control?.interval_seconds || 0);
-      const roundTime = interval && cycles ? seconds(interval * cycles) : '—';
+      const interval = Number(scannerControlPayload?.control?.interval_seconds ?? 0);
+      const roundTime = cycles
+        ? (interval === 0 ? scannerUiText('без ожидания между циклами') : seconds(interval * cycles))
+        : '—';
       const rotationNote = preview.rotation?.eventual_catalog_coverage
         ? ` · ${scannerUiText('ротация по всему каталогу')}`
         : '';
@@ -2868,25 +2959,36 @@ HTML = r"""<!doctype html>
       document.getElementById('scannerTargetSummary').innerHTML = `
         <span><small>Доступно локально</small><b>${fmt.format(selection.eligible_count || preview.total_matching || 0)}</b></span>
         <span><small>Выбрано сейчас</small><b>${escapeHtml(selectedDisplay)}</b></span>
-        <span><small>Лимит цикла</small><b>${fmt.format(budget.targets_per_cycle || 0)} целей · ${fmt.format(budget.max_requests_per_cycle || 0)} запросов</b></span>
+        <span><small>Лимит цикла</small><b>${fmt.format(perCycle)} целей · до ${fmt.format(draft.listings_per_target || budget.listings_per_target || 0)} скинов на цель</b></span>
         <span><small>Оценка полного круга</small><b>${roundDisplay}</b></span>`;
 
-      const items = preview.items || [];
+      const pageItems = preview.items || [];
+      const selectedOnPage = pageItems.filter(item => scannerTargetSelected(item, draft)).length;
+      text('scannerVisibleAll', fmt.format(pageItems.length));
+      text('scannerVisibleSelected', fmt.format(selectedOnPage));
+      text('scannerVisibleUnselected', fmt.format(pageItems.length - selectedOnPage));
+      document.querySelectorAll('[data-target-view]').forEach(button => {
+        const active = button.dataset.targetView === scannerTargetView;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-pressed', String(active));
+      });
+      const items = visibleScannerTargetItems();
       rows('scannerTargetBody', items, item => {
         const selected = scannerTargetSelected(item, draft);
-        return `<tr>
-          <td><input class="scanner-target-row-check" type="checkbox" data-target-key="${escapeHtml(item.target_key || '')}" ${selected ? 'checked' : ''} ${scannerTargetBusy ? 'disabled' : ''}></td>
-          <td><div class="scanner-target-name"><strong>${escapeHtml(item.name || item.market_hash_name || '—')}</strong><small>${escapeHtml(item.target_key || '')}</small></div></td>
+        const checkboxId = `scannerChoice${pageItems.indexOf(item)}`;
+        return `<tr class="${selected ? 'scanner-target-selected' : ''}">
+          <td><input id="${checkboxId}" class="scanner-target-row-check" type="checkbox" data-target-key="${escapeHtml(item.target_key || '')}" ${selected ? 'checked' : ''} ${scannerTargetBusy ? 'disabled' : ''}></td>
+          <td><label class="scanner-target-name" for="${checkboxId}"><strong>${escapeHtml(item.name || item.market_hash_name || '—')}</strong><small>${escapeHtml(item.target_key || '')}</small></label></td>
           <td>${escapeHtml(scannerTargetReason(item))}</td>
           <td>${escapeHtml(scannerTargetStats(scannerTargetProfile, item))}</td>
         </tr>`;
       });
       if (!items.length) {
-        document.getElementById('scannerTargetBody').innerHTML = '<tr><td colspan="4" class="muted">По этому поиску целей нет.</td></tr>';
+        document.getElementById('scannerTargetBody').innerHTML = `<tr><td colspan="4" class="scanner-target-empty">${scannerUiText(pageItems.length ? 'На этой странице нет целей с таким выбором.' : 'По этому поиску целей нет.')}</td></tr>`;
       }
 
       const from = preview.total_matching ? Number(preview.offset || 0) + 1 : 0;
-      const to = Number(preview.offset || 0) + items.length;
+      const to = Number(preview.offset || 0) + pageItems.length;
       text('scannerTargetPageInfo', `${fmt.format(from)}–${fmt.format(to)} / ${fmt.format(preview.total_matching || 0)}`);
       document.getElementById('scannerTargetPrev').disabled = scannerTargetBusy || Number(preview.offset || 0) <= 0;
       document.getElementById('scannerTargetNext').disabled = scannerTargetBusy || preview.next_offset === null || preview.next_offset === undefined;
@@ -2894,8 +2996,17 @@ HTML = r"""<!doctype html>
       document.getElementById('scannerTargetSelectVisible').disabled = scannerTargetBusy || !items.length;
       document.getElementById('scannerTargetClearVisible').disabled = scannerTargetBusy || !items.length;
       document.getElementById('scannerTargetResetOverrides').disabled = scannerTargetBusy ||
-        (!(draft.include || []).length && !(draft.exclude || []).length);
+        (!(draft.include || []).length && !(draft.exclude || []).length && !(draft.include_groups || []).length);
       renderScannerProfileCards();
+    }
+
+    function visibleScannerTargetItems() {
+      const draft = scannerTargetDraft();
+      return (scannerTargetPreview?.items || []).filter(item => {
+        if (scannerTargetView === 'all') return true;
+        const selected = scannerTargetSelected(item, draft);
+        return scannerTargetView === 'selected' ? selected : !selected;
+      });
     }
 
     async function refreshScannerTargets({ refreshControl = false } = {}) {
@@ -2973,9 +3084,10 @@ HTML = r"""<!doctype html>
       const before = scannerTargetSelected(item, draft);
       const include = new Set(draft.include || []);
       const exclude = new Set(draft.exclude || []);
-      applyScannerTargetChoice(item, checked, draft.selection_mode, include, exclude);
+      const draftItem = scannerTargetWithDraftGroup(item, draft);
+      applyScannerTargetChoice(draftItem, checked, draft.selection_mode, include, exclude);
       const after = scannerTargetSelectedWithOverrides(
-        item, draft.selection_mode, include, exclude
+        draftItem, draft.selection_mode, include, exclude
       );
       if (before === after) return;
       const limits = scannerTargetsPayload?.limits || {};
@@ -3002,9 +3114,9 @@ HTML = r"""<!doctype html>
       const include = new Set(draft.include || []);
       const exclude = new Set(draft.exclude || []);
       let changed = false;
-      for (const item of scannerTargetPreview?.items || []) {
+      for (const item of visibleScannerTargetItems()) {
         if (scannerTargetSelected(item, draft) === selected) continue;
-        applyScannerTargetChoice(item, selected, draft.selection_mode, include, exclude);
+        applyScannerTargetChoice(scannerTargetWithDraftGroup(item, draft), selected, draft.selection_mode, include, exclude);
         changed = true;
       }
       if (!changed) return;
@@ -3024,6 +3136,51 @@ HTML = r"""<!doctype html>
       renderScannerTargetPreview();
     }
 
+    function updateScannerBudget(field, inputId) {
+      if (scannerTargetBusy) return;
+      const draft = scannerTargetDraft();
+      const input = document.getElementById(inputId);
+      if (!draft || !input) return;
+      const value = Number(input.value);
+      const minimum = Number(input.min || 1);
+      const maximum = Number(input.max || Number.MAX_SAFE_INTEGER);
+      if (!Number.isInteger(value) || value < minimum || value > maximum) {
+        setScannerTargetFeedback(`Укажи целое число от ${minimum} до ${maximum}.`, 'bad');
+        document.getElementById('scannerTargetSave').disabled = true;
+        return;
+      }
+      draft[field] = value;
+      draft.dirty = true;
+      setScannerTargetFeedback('Есть несохранённые изменения лимитов.', 'warn');
+      renderScannerTargetPreview();
+    }
+
+    function updateScannerStickerGroups(names, selected) {
+      if (scannerTargetBusy || scannerTargetProfile !== 'sticker_guns') return;
+      const draft = scannerTargetDraft();
+      if (!draft) return;
+      const groups = new Set(draft.include_groups || []);
+      for (const name of names) {
+        if (selected) groups.add(name);
+        else groups.delete(name);
+      }
+      const maximum = Number(scannerTargetsPayload?.limits?.max_included_groups || 50);
+      if (groups.size > maximum) {
+        setScannerTargetFeedback(`Можно выбрать не больше ${maximum} групп.`, 'bad');
+        return;
+      }
+      draft.include_groups = Array.from(groups);
+      if (selected) draft.selection_mode = 'custom';
+      draft.dirty = true;
+      setScannerTargetFeedback(
+        selected
+          ? `Группа добавлена целиком. Всего групп: ${groups.size}.`
+          : `Группа убрана. Осталось групп: ${groups.size}.`,
+        'warn',
+      );
+      renderScannerTargetPreview();
+    }
+
     async function saveScannerTargetProfile() {
       const draft = scannerTargetDraft();
       if (!draft || !draft.dirty || scannerTargetBusy) return;
@@ -3033,6 +3190,9 @@ HTML = r"""<!doctype html>
         selection_mode: draft.selection_mode,
         include: [...draft.include],
         exclude: [...draft.exclude],
+        include_groups: [...(draft.include_groups || [])],
+        targets_per_cycle: Number(draft.targets_per_cycle),
+        listings_per_target: Number(draft.listings_per_target),
       };
       scannerTargetBusy = true;
       renderScannerTargetPreview();
@@ -3757,7 +3917,7 @@ HTML = r"""<!doctype html>
         verifying_cache: 'проверка кэша', building_features: 'признаки', preparing_features: 'подготовка признаков',
         building_vocabularies: 'словари', encoding_arrays: 'кодирование', training_point: 'основная модель',
         training_low_interval: 'нижняя граница q15', training_high_interval: 'верхняя граница q85',
-        training_epochs: 'эпохи Nova', quality_check: 'проверка качества', saving_candidate: 'сохранение кандидата',
+        training_epochs: 'эпохи нейросети', quality_check: 'проверка качества', saving_candidate: 'сохранение кандидата',
         quality_gate: 'сравнение со старой моделью', quality_rejected: 'не прошла порог качества',
         validation_failed: 'ошибка проверки целостности', integrity_rejected: 'не прошла SHA-256/проверку целостности',
         hot_activation: 'безопасная горячая установка', active: 'новая модель активна',
@@ -4449,7 +4609,12 @@ HTML = r"""<!doctype html>
       });
     }
 
+    let dashboardRefreshInFlight = false;
     async function refresh() {
+      // A slow aggregate must never stack several identical requests on the
+      // server; the next interval simply waits for the running one.
+      if (dashboardRefreshInFlight) return;
+      dashboardRefreshInFlight = true;
       try {
         const response = await fetch(`/api/dashboard?token=${encodeURIComponent(dashboardToken)}`, { cache: 'no-store' });
         const data = await response.json();
@@ -4460,6 +4625,8 @@ HTML = r"""<!doctype html>
         }
       } catch (error) {
         text('lastUpdate', `error: ${error.message}`);
+      } finally {
+        dashboardRefreshInFlight = false;
       }
     }
 
@@ -4580,8 +4747,8 @@ HTML = r"""<!doctype html>
     document.getElementById('scannerApplyInterval').addEventListener('click', () => {
       const input = document.getElementById('scannerIntervalMinutes');
       const minutes = Number(input.value);
-      if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) {
-        setScannerFeedback('Укажи интервал от 1 до 1440 минут.', 'bad');
+      if (!Number.isInteger(minutes) || minutes < 0 || minutes > 1440) {
+        setScannerFeedback('Укажи целое число от 0 до 1440 минут.', 'bad');
         input.focus();
         return;
       }
@@ -4611,6 +4778,7 @@ HTML = r"""<!doctype html>
       if (!card || scannerTargetBusy) return;
       scannerTargetProfile = card.dataset.scannerProfile;
       scannerTargetOffset = 0;
+      scannerTargetView = 'all';
       document.getElementById('scannerTargetSearch').value = '';
       renderScannerProfileCards();
       refreshScannerTargets();
@@ -4628,6 +4796,7 @@ HTML = r"""<!doctype html>
 
     document.getElementById('scannerTargetSearchButton').addEventListener('click', () => {
       scannerTargetOffset = 0;
+      scannerTargetView = 'all';
       refreshScannerTargets();
     });
 
@@ -4663,6 +4832,40 @@ HTML = r"""<!doctype html>
       renderScannerTargetPreview();
     });
 
+    document.getElementById('scannerTargetsPerCycle').addEventListener('change', () => {
+      updateScannerBudget('targets_per_cycle', 'scannerTargetsPerCycle');
+    });
+
+    document.getElementById('scannerListingsPerTarget').addEventListener('change', () => {
+      updateScannerBudget('listings_per_target', 'scannerListingsPerTarget');
+    });
+
+    document.getElementById('scannerStickerGroupAdd').addEventListener('click', () => {
+      const name = document.getElementById('scannerStickerGroupSelect').value;
+      if (name) updateScannerStickerGroups([name], true);
+    });
+
+    document.getElementById('scannerStickerGroupRemove').addEventListener('click', () => {
+      const name = document.getElementById('scannerStickerGroupSelect').value;
+      if (name) updateScannerStickerGroups([name], false);
+    });
+
+    document.getElementById('scannerStickerGroupChips').addEventListener('click', event => {
+      const button = event.target.closest('[data-remove-scanner-group]');
+      if (button) updateScannerStickerGroups([button.dataset.removeScannerGroup], false);
+    });
+
+    document.getElementById('scannerSelectionTabs').addEventListener('click', event => {
+      const button = event.target.closest('[data-target-view]');
+      if (!button) return;
+      scannerTargetView = button.dataset.targetView;
+      renderScannerTargetPreview();
+    });
+
+    document.getElementById('scannerStickerKatoPreset').addEventListener('click', () => {
+      updateScannerStickerGroups(['Katowice 2014', 'Katowice 2015'], true);
+    });
+
     document.getElementById('scannerTargetBody').addEventListener('change', event => {
       if (scannerTargetBusy) return;
       const checkbox = event.target.closest('[data-target-key]');
@@ -4681,9 +4884,10 @@ HTML = r"""<!doctype html>
     document.getElementById('scannerTargetResetOverrides').addEventListener('click', () => {
       if (scannerTargetBusy) return;
       const draft = scannerTargetDraft();
-      if (!draft || (!(draft.include || []).length && !(draft.exclude || []).length)) return;
+      if (!draft || (!(draft.include || []).length && !(draft.exclude || []).length && !(draft.include_groups || []).length)) return;
       draft.include = [];
       draft.exclude = [];
+      draft.include_groups = [];
       draft.dirty = true;
       setScannerTargetFeedback('Ручные правки сброшены. Сохрани профиль, чтобы применить изменение.', 'warn');
       renderScannerTargetPreview();
@@ -4782,12 +4986,15 @@ HTML = r"""<!doctype html>
     refreshScannerControl({ quiet: false });
     refreshModelTraining();
     refresh();
-    setInterval(refresh, __LIVE_REFRESH_MS__);
+    setInterval(() => {
+      if (!document.hidden) refresh();
+    }, __LIVE_REFRESH_MS__);
     setInterval(() => {
       if (!document.hidden) refreshScannerControl();
     }, 5000);
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
+        refresh();
         refreshScannerControl({ quiet: false });
         scheduleModelTrainingPoll(0);
       } else {
@@ -5067,6 +5274,10 @@ DEAL_HTML = r"""<!doctype html>
           <label class="wide">CSFloat link or text
             <input id="urlText" placeholder="Paste URL or exact market_hash_name">
           </label>
+          <div class="wide small" aria-live="polite">
+            <span class="muted">Listing created (MSK)</span>:
+            <time id="listingCreatedAt">unknown</time>
+          </div>
           <label class="wide">Skin name
             <input id="skinName" placeholder="AK-47 | Slate (Field-Tested)">
           </label>
@@ -5237,7 +5448,7 @@ DEAL_HTML = r"""<!doctype html>
     }
 
     function modelLabel(name) {
-      return ({ almaz: 'Almaz', igor: 'Igor', nova: 'Nova' })[name] || String(name || 'Model');
+      return ({ almaz: 'Almaz', igor: 'Igor', nova: 'Nova', vega: 'Vega (advisory)' })[name] || String(name || 'Model');
     }
 
     function parseName(text) {
@@ -5329,8 +5540,22 @@ DEAL_HTML = r"""<!doctype html>
       return payload;
     }
 
+    function renderListingCreatedAt(payload = {}) {
+      const element = document.getElementById('listingCreatedAt');
+      const value = payload.created_at || payload.createdAt || payload.listed_at || payload.listedAt;
+      const date = value ? new Date(value) : null;
+      if (!date || Number.isNaN(date.getTime())) {
+        element.textContent = 'unknown';
+        element.removeAttribute('datetime');
+        return;
+      }
+      element.dateTime = date.toISOString();
+      element.textContent = date.toLocaleString('__CS2_INTL_LOCALE__', { timeZone: 'Europe/Moscow' });
+    }
+
     function fillDealForm(payload) {
       if (!payload) return;
+      renderListingCreatedAt(payload);
       if (payload.url_text) document.getElementById('urlText').value = payload.url_text;
       if (payload.name) document.getElementById('skinName').value = payload.name;
       if (payload.buy_price_cents) document.getElementById('buyPrice').value = (Number(payload.buy_price_cents) / 100).toFixed(2);
@@ -5391,7 +5616,12 @@ DEAL_HTML = r"""<!doctype html>
         verdict.textContent = title;
 
         const errors = payload.model_errors || {};
-        comparisonGrid.innerHTML = ['almaz', 'igor', 'nova'].map(name => {
+        const modelVerdictLabel = value => {
+          const labels = { good: 'Profitable', watch: 'Watch', thin: 'Thin margin', bad: 'Unprofitable' };
+          const label = labels[value] || value;
+          return window.cs2T ? window.cs2T(label) : label;
+        };
+        comparisonGrid.innerHTML = ['almaz', 'igor', 'nova', 'vega'].map(name => {
           const model = models[name];
           if (!model) {
             return `<article class="model-prediction-card unavailable"><div class="model-prediction-head"><span>${modelLabel(name)}</span><span class="model-state bad">unavailable</span></div><strong>—</strong><small>${escapeHtml(errors[name] || 'no prediction')}</small></article>`;
@@ -5406,7 +5636,7 @@ DEAL_HTML = r"""<!doctype html>
             ? 'profit unknown'
             : `${money(model.profit_cents)} profit`;
           return `<article class="model-prediction-card${selected}">
-            <div class="model-prediction-head"><span>${modelLabel(name)}</span><span class="model-state ${verdictTone}">${escapeHtml(verdictName)}</span></div>
+            <div class="model-prediction-head"><span>${modelLabel(name)}</span><span class="model-state ${verdictTone}">${escapeHtml(modelVerdictLabel(verdictName))}</span></div>
             <strong>${optionalMoney(model.predicted_price_cents)}</strong>
             <small>${optionalMoney(model.low_price_cents)} – ${optionalMoney(model.high_price_cents)}</small>
             <div class="model-prediction-foot">${escapeHtml(roi)} · ${escapeHtml(profit)}</div>
@@ -5467,7 +5697,12 @@ DEAL_HTML = r"""<!doctype html>
 
     document.getElementById('predictButton').addEventListener('click', runPrediction);
 
+    ['urlText', 'skinName'].forEach(id => {
+      document.getElementById(id).addEventListener('input', () => renderListingCreatedAt());
+    });
+
     document.getElementById('fetchCsfloatButton').addEventListener('click', async () => {
+      renderListingCreatedAt();
       try {
         const text = val('urlText') || val('skinName');
         if (!text) {
@@ -6113,24 +6348,39 @@ DEALS_HTML = r"""<!doctype html>
           </select></label>
           <button class="button button-primary" id="searchButton" type="button">Apply</button>
         </div>
-        <details class="disclosure filter-disclosure">
-          <summary><span>More filters</span><small>модели, цена, безопасный ROI/прибыль, ликвидность, float и стикеры</small></summary>
-          <div class="filter-grid disclosure-body">
-            <label class="filter-field"><span>View</span><select id="viewSelect" title="View mode">
-              <option value="auto">Auto view</option>
-              <option value="cards">Cards</option>
-              <option value="table">Table</option>
-            </select></label>
+        <div class="deal-quick-filters" id="dealQuickFilters" aria-label="Quick filters">
+          <span class="muted">Quick filters</span>
+          <button class="filter-chip" type="button" data-deal-preset="safe" aria-pressed="false">Safe consensus</button>
+          <button class="filter-chip" type="button" data-deal-preset="vega" aria-pressed="false">Vega · advisory</button>
+          <button class="filter-chip" type="button" data-deal-preset="budget" aria-pressed="false">Under $10</button>
+          <button class="filter-chip" type="button" data-deal-preset="fresh" aria-pressed="false">Seen 1h</button>
+          <button class="filter-chip" type="button" data-deal-preset="liquid" aria-pressed="false">Liquid 60+</button>
+        </div>
+        <div class="filter-grid deal-main-filters">
             <label class="filter-field"><span>Source model</span><select id="categorySelect" title="Model match filter">
               <option value="all">All models</option>
               <option value="almaz">All Almaz</option>
               <option value="igor">All Igor</option>
               <option value="nova">All Nova</option>
+              <option value="vega">Vega · advisory</option>
               <option value="all_three">All three models</option>
               <option value="both">Both models</option>
               <option value="only_almaz">Only Almaz</option>
               <option value="only_igor">Only Igor</option>
               <option value="only_nova">Only Nova</option>
+            </select></label>
+            <label class="filter-field"><span>Item category</span><select id="assetTypeSelect">
+              <option value="all">All items</option>
+              <option value="weapon_skin">Weapon skins</option>
+              <option value="knife">Knives</option>
+              <option value="glove">Gloves</option>
+            </select></label>
+            <label class="filter-field"><span>Discovery source</span><select id="discoverySourceSelect">
+              <option value="all">All sources</option>
+              <option value="sticker">Sticker search</option>
+              <option value="liquid_skin">Liquid skins</option>
+              <option value="knife">Knife search</option>
+              <option value="glove">Glove search</option>
             </select></label>
             <label class="filter-field"><span>Agreement</span><select id="confidenceSelect" title="Agreement and risk filter">
               <option value="all">Any agreement</option>
@@ -6139,6 +6389,10 @@ DEALS_HTML = r"""<!doctype html>
               <option value="disagreement">Has disagreement</option>
               <option value="single_signal">Single positive signal</option>
             </select></label>
+        </div>
+        <details class="disclosure filter-disclosure">
+          <summary><span>More filters</span><small>Price, profit, liquidity, float and freshness</small><span class="filter-count" id="dealFilterCount">0</span></summary>
+          <div class="filter-grid disclosure-body">
             <label class="filter-field"><span>Sale type</span><select id="listingTypeSelect" title="Listing type">
               <option value="all">All sale types</option>
               <option value="buy_now">Buy now</option>
@@ -6168,15 +6422,21 @@ DEALS_HTML = r"""<!doctype html>
               <option value="72">Created 3d</option>
               <option value="168">Created 7d</option>
             </select></label>
-            <button class="button" id="resetFiltersButton" type="button">Reset filters</button>
           </div>
         </details>
+        <div class="deal-active-filter-bar">
+          <div class="deal-active-filters" id="dealActiveFilters" aria-label="Active filters"></div>
+          <button class="button" id="resetFiltersButton" type="button">Reset filters</button>
+        </div>
+        <div class="deal-results-status" id="dealResultsStatus" role="status" aria-live="polite"></div>
         <div class="pagination-bar">
-          <span class="muted">100 opportunities per page</span>
+          <label class="deal-view-control"><span>View</span><select id="viewSelect" title="View mode">
+            <option value="auto">Auto view</option><option value="cards">Cards</option><option value="table">Table</option>
+          </select></label>
           <div><button class="button" id="prevButton" type="button">Previous</button><button class="button" id="nextButton" type="button">Next</button></div>
         </div>
       </div>
-      <div class="risk-note">A safe consensus means at least two models rate the listing positively and no active model disagrees. Conservative ROI uses the lowest estimate, not the most optimistic one.</div>
+      <div class="risk-note">Consensus uses Almaz, Igor and Nova. Vega adds an advisory opinion and does not vote in consensus. Conservative ROI uses the lowest core model estimate.</div>
       <div class="deal-summary-grid" aria-label="Deal summary">
         <div class="summary-card"><span>Matching deals</span><strong id="dealSummaryTotal">0</strong></div>
         <div class="summary-card"><span>Safe consensus</span><strong id="dealSummarySafe">0</strong></div>
@@ -6188,17 +6448,16 @@ DEALS_HTML = r"""<!doctype html>
           <thead>
             <tr>
               <th style="width: 3%;">#</th>
-              <th style="width: 38%;">Listing</th>
-              <th style="width: 8%;">Buy</th>
-              <th style="width: 22%;">Models</th>
-              <th style="width: 14%;">Details</th>
-              <th style="width: 11%;">Time</th>
-              <th style="width: 4%;">Links</th>
+              <th style="width: 31%;">Listing</th>
+              <th style="width: 8%;" class="num-cell">Buy</th>
+              <th style="width: 24%;">Models</th>
+              <th style="width: 20%;">Details</th>
+              <th style="width: 14%;">Time</th>
             </tr>
           </thead>
           <tbody id="rowsBody"></tbody>
         </table>
-        <div class="empty" id="emptyState" hidden>No saved deals yet. Start `deal_scanner.py` and wait until it finds listings that pass the filters.</div>
+        <div class="empty" id="emptyState" hidden></div>
       </div>
       <div class="mobile-deals" id="mobileDeals"></div>
     </section>
@@ -6229,9 +6488,13 @@ DEALS_HTML = r"""<!doctype html>
     let offset = 0;
     const limit = 100;
     let latestRefresh = 0;
+    let dealRefreshController = null;
+    let dealSearchTimer = null;
     const filterStateFields = {
       search: 'search',
       category: 'categorySelect',
+      asset_type: 'assetTypeSelect',
+      discovery_source: 'discoverySourceSelect',
       confidence: 'confidenceSelect',
       listing_type: 'listingTypeSelect',
       sort: 'sortSelect',
@@ -6244,6 +6507,14 @@ DEALS_HTML = r"""<!doctype html>
       min_liquidity: 'minLiquidity',
       max_float: 'maxFloat',
       min_sticker_value: 'minStickerValue',
+    };
+    const dealFilterEmptyValues = {
+      category: 'all', asset_type: 'all', discovery_source: 'all', confidence: 'all',
+      listing_type: 'all', seen_hours: '0', created_hours: '0', sort: 'seen_new',
+    };
+    const dealPresets = {
+      safe: { confidence: 'consensus' }, vega: { category: 'vega' },
+      budget: { max_price: '10' }, fresh: { seen_hours: '1' }, liquid: { min_liquidity: '60' },
     };
     const zoomState = {
       scale: 1,
@@ -6333,6 +6604,59 @@ DEALS_HTML = r"""<!doctype html>
       else params.delete('offset');
       const query = params.toString();
       history.replaceState(null, '', `${window.location.pathname}${query ? `?${query}` : ''}`);
+    }
+
+    function dealUiText(value) {
+      return window.cs2T ? window.cs2T(value) : value;
+    }
+
+    function activeDealFilters() {
+      return Object.entries(filterStateFields).filter(([param, id]) => {
+        const value = document.getElementById(id).value.trim();
+        return param !== 'sort' && value !== '' && value !== (dealFilterEmptyValues[param] || '');
+      });
+    }
+
+    function renderDealFilterChips() {
+      const filters = activeDealFilters();
+      document.getElementById('dealFilterCount').textContent = fmt.format(filters.length);
+      document.getElementById('dealActiveFilters').innerHTML = filters.length ? filters.map(([param, id]) => {
+        const input = document.getElementById(id);
+        const label = input.closest('label')?.querySelector('span')?.textContent || param;
+        const value = input.tagName === 'SELECT' ? input.selectedOptions[0].textContent : input.value;
+        return `<button class="filter-chip filter-chip-removable" type="button" data-clear-deal-filter="${escapeHtml(param)}" aria-label="${escapeHtml(dealUiText('Remove filter'))}: ${escapeHtml(label)}"><span>${escapeHtml(label)}: <b>${escapeHtml(value)}</b></span><span aria-hidden="true">×</span></button>`;
+      }).join('') : `<span class="muted">${escapeHtml(dealUiText('All saved opportunities'))}</span>`;
+      document.querySelectorAll('[data-deal-preset]').forEach(button => {
+        const selected = Object.entries(dealPresets[button.dataset.dealPreset]).every(([param, value]) => {
+          const current = document.getElementById(filterStateFields[param]).value;
+          return current === value || (current !== '' && Number(current) === Number(value));
+        });
+        button.classList.toggle('active', selected);
+        button.setAttribute('aria-pressed', String(selected));
+      });
+    }
+
+    function resetDealFilters() {
+      for (const [param, id] of Object.entries(filterStateFields)) {
+        document.getElementById(id).value = dealFilterEmptyValues[param] || '';
+      }
+      offset = 0;
+      refresh().catch(showDealRefreshError);
+    }
+
+    function showDealRefreshError(error) {
+      if (error.name === 'AbortError') return;
+      const status = document.getElementById('dealResultsStatus');
+      status.textContent = `${dealUiText('Could not load deals')}: ${error.message}`;
+      status.dataset.tone = 'bad';
+    }
+
+    function dealEmptyContent() {
+      const title = dealUiText('No matching opportunities');
+      const message = dealUiText(document.getElementById('categorySelect').value === 'vega'
+        ? 'No saved deals with a positive Vega opinion match these filters. Try another model or a longer time range.'
+        : 'Try a wider price range, another model or an earlier scan time.');
+      return `<div class="deal-empty-icon" aria-hidden="true">⌕</div><strong>${escapeHtml(title)}</strong><p>${escapeHtml(message)}</p><button class="button" type="button" data-reset-deal-filters>${escapeHtml(dealUiText('Reset filters'))}</button>`;
     }
 
     function priceInputFromCents(value) {
@@ -6471,28 +6795,66 @@ DEALS_HTML = r"""<!doctype html>
       return `<div class="sticker-list">${stickers.map(sticker => `
         <span class="sticker-pill" title="${escapeHtml(sticker.name || '')}">
           ${image(sticker.icon_url, sticker.name, 'sticker-img')}
-          <span>${escapeHtml(sticker.name || 'unknown')}</span>
-          <span>${money(sticker.price_cents || sticker.raw_price_cents || 0)}</span>
-          <span>wear ${number(sticker.wear, 3)}</span>
+          <span class="sticker-copy">
+            <span class="sticker-name">${escapeHtml(String(sticker.name || 'unknown').replace(/^Sticker \| /, ''))}</span>
+            <span class="sticker-meta">${(sticker.price_cents || sticker.raw_price_cents) ? money(sticker.price_cents || sticker.raw_price_cents) : '—'}${stickerWearText(sticker.wear)}</span>
+          </span>
         </span>
       `).join('')}</div>`;
     }
 
-    function modelCell(model, label) {
+    function stickerWearText(wear) {
+      // -1 is the scanner's "wear unknown" marker, not a measurable value.
+      const value = Number(wear);
+      if (wear === null || wear === undefined || wear === '' || !Number.isFinite(value) || value < 0) return '';
+      return ` · ${dealUiText('wear')} ${number(value, 3)}`;
+    }
+
+    function modelStack(row) {
+      const models = row.models || {};
+      const expected = row.item_kind === 'knife' ? ['knives']
+        : row.item_kind === 'glove' ? ['gloves'] : ['almaz', 'igor', 'nova', 'vega'];
+      const labels = { almaz: 'Almaz', igor: 'Igor', nova: 'Nova', vega: 'Vega · advisory', knives: 'Knife model', gloves: 'Glove model' };
+      return [...new Set([...expected, ...Object.keys(models)])].map(name =>
+        modelCell(models[name], dealUiText(labels[name] || name), name)
+      ).join('');
+    }
+
+    function modelCell(model, label, modelName = '') {
       if (!model) {
-        return `<div class="model-box"><div class="model-title">${escapeHtml(label)}</div><div class="meta">not found</div></div>`;
+        return `<div class="model-box model-box-missing" data-model="${escapeHtml(modelName)}"><div class="model-title">${escapeHtml(label)}</div><div class="meta">not found</div></div>`;
       }
       const verdict = model.verdict || 'unknown';
       const verdictClass = verdict === 'good' ? 'good' : (verdict === 'bad' ? 'bad' : 'watch');
       const profitClass = Number(model.profit_cents || 0) >= 0 ? 'money-good' : 'money-bad';
       const roiText = model.roi_percent === null || model.roi_percent === undefined ? 'unknown' : `${Number(model.roi_percent).toFixed(2)}%`;
-      return `<div class="model-box">
-        <div class="model-title">${escapeHtml(label)}: ${money(model.predicted_price_cents)}</div>
-        <div>net ${money(model.net_expected_cents)} | <span class="${profitClass}">profit ${money(model.profit_cents)}</span></div>
+      return `<div class="model-box" data-model="${escapeHtml(modelName)}" data-verdict="${verdictClass}">
+        <div class="model-title"><span>${escapeHtml(label)}</span><strong>${optionalMoney(model.predicted_price_cents)}</strong></div>
+        <div>${escapeHtml(dealUiText('net'))} ${optionalMoney(model.net_expected_cents)} · <span class="${profitClass}">${escapeHtml(dealUiText('profit'))} ${optionalMoney(model.profit_cents)}</span></div>
         <div>ROI ${roiText} | liquid ${number(model.liquidity_score, 0)}</div>
-        <div><span class="verdict ${verdictClass}"><span class="dot"></span>${escapeHtml(verdict)}</span></div>
-        <div class="meta">${escapeHtml(model.pricing_method || '')}</div>
+        <div><span class="verdict ${verdictClass}"><span class="dot"></span>${escapeHtml(verdictLabel(verdict))}</span></div>
       </div>`;
+    }
+
+    function verdictLabel(verdict) {
+      const labels = { good: 'Profitable', watch: 'Watch', thin: 'Thin margin', bad: 'Unprofitable' };
+      return dealUiText(labels[verdict] || verdict || 'unknown');
+    }
+
+    function categoryLabel(value) {
+      const labels = {
+        all: 'All models',
+        all_three: 'All three models',
+        both: 'Both models',
+        only_almaz: 'Only Almaz',
+        only_igor: 'Only Igor',
+        only_nova: 'Only Nova',
+        almaz: 'All Almaz',
+        igor: 'All Igor',
+        nova: 'All Nova',
+        vega: 'Vega · advisory',
+      };
+      return dealUiText(labels[value] || value || 'All models');
     }
 
     function detailLine(label, value) {
@@ -6529,7 +6891,8 @@ DEALS_HTML = r"""<!doctype html>
       const className = level === 'low'
         ? 'confidence-safe'
         : (level === 'high' ? 'confidence-bad' : 'confidence-warn');
-      return `<span class="category ${className}">${escapeHtml(level)} ${Number.isFinite(score) ? score.toFixed(0) : '—'}/100</span>`;
+      const levelLabels = { low: 'low risk', medium: 'medium risk', high: 'high risk' };
+      return `<span class="category ${className}">${escapeHtml(dealUiText(levelLabels[level] || level))} · ${Number.isFinite(score) ? score.toFixed(0) : '—'}/100</span>`;
     }
 
     function ensembleWeights(intelligence) {
@@ -6562,11 +6925,11 @@ DEALS_HTML = r"""<!doctype html>
       const sources = Array.isArray(row.discovery_sources) && row.discovery_sources.length
         ? row.discovery_sources
         : [{ source_type: row.source_type, source_name: row.source_name || row.source_sticker_name }];
-      const labels = sources.map(source => source.source_type === 'liquid_skin'
-        ? 'ликвидный ≤ $10'
-        : source.source_type === 'sticker'
-          ? `стикер: ${source.source_name || 'target'}`
-          : (source.source_name || source.source_type || 'scanner'));
+      const sourceLabels = { liquid_skin: 'Liquid skins', sticker: 'Sticker search', knife: 'Knife search', glove: 'Glove search' };
+      const labels = sources.map(source => {
+        const label = dealUiText(sourceLabels[source.source_type] || 'Scanner');
+        return source.source_type === 'sticker' && source.source_name ? `${label}: ${source.source_name}` : label;
+      });
       return [...new Set(labels)].map(label => `<span class="category">${escapeHtml(label)}</span>`).join(' ');
     }
 
@@ -6574,7 +6937,7 @@ DEALS_HTML = r"""<!doctype html>
       return `<div class="detail-stack">
         ${intelligenceDetailLines(row)}
         ${detailLine('signal', confidenceBadge(row))}
-        ${detailLine('models', `<span class="category">${escapeHtml(row.category || 'all')}</span>`)}
+        ${detailLine('models', `<span class="category">${escapeHtml(categoryLabel(row.category))}</span>`)}
         ${detailLine('source', discoverySourceLabel(row))}
         ${detailLine('safe ROI', percent(row.conservative_roi_percent))}
         ${detailLine('safe profit', optionalMoney(row.conservative_profit_cents))}
@@ -6588,10 +6951,12 @@ DEALS_HTML = r"""<!doctype html>
     }
 
     function timeCell(row) {
-      return `<div class="detail-stack">
+      // Links share the time column: a separate 4% column could not fit the
+      // "CSFloat" label and wrapped it one letter per line.
+      return `<div class="detail-stack time-stack">
         ${detailLine('created', msk(row.listing_created_at))}
         ${detailLine('seen', msk(row.last_seen_at))}
-      </div>`;
+      </div>${linksCell(row)}`;
     }
 
     function linksCell(row) {
@@ -6645,7 +7010,7 @@ DEALS_HTML = r"""<!doctype html>
           </div>
         </div>
         <div class="deal-card-section">
-          <div class="model-stack">${modelCell(models.almaz, 'Almaz')}${modelCell(models.igor, 'Igor')}${modelCell(models.nova, 'Nova')}</div>
+          <div class="model-stack">${modelStack(row)}</div>
         </div>
         <div class="deal-card-grid">
           ${mini('risk', riskBadge(intelligence))}
@@ -6654,7 +7019,7 @@ DEALS_HTML = r"""<!doctype html>
           ${mini('risk ranking', Number.isFinite(ranking) ? ranking.toFixed(1) : '—')}
           ${mini('dynamic weights', `<span class="meta">${ensembleWeights(intelligence)}</span>`)}
           ${mini('signal', confidenceBadge(row))}
-          ${mini('models', `<span class="category">${escapeHtml(row.category || 'all')}</span>`)}
+          ${mini('models', `<span class="category">${escapeHtml(categoryLabel(row.category))}</span>`)}
           ${mini('source', discoverySourceLabel(row))}
           ${mini('conservative ROI', percent(row.conservative_roi_percent))}
           ${mini('conservative profit', optionalMoney(row.conservative_profit_cents))}
@@ -6678,8 +7043,11 @@ DEALS_HTML = r"""<!doctype html>
       const shownFrom = total ? offset + 1 : 0;
       const shownTo = Math.min(offset + items.length, total);
       const summary = data.summary || {};
-      document.getElementById('pageInfo').textContent =
-        `${fmt.format(shownFrom)}-${fmt.format(shownTo)} / ${fmt.format(total)} | safe ${fmt.format((summary.consensus || 0) + (summary.unanimous_three || 0))} | disagree ${fmt.format(summary.disagreement || 0)} | all 3 ${fmt.format(summary.all_three || 0)}`;
+      document.getElementById('pageInfo').textContent = `${fmt.format(shownFrom)}–${fmt.format(shownTo)} / ${fmt.format(total)}`;
+      const status = document.getElementById('dealResultsStatus');
+      status.textContent = `${dealUiText('Matching deals')}: ${fmt.format(total)} · ${dealUiText('On this page')}: ${fmt.format(items.length)}`;
+      status.dataset.tone = '';
+      renderDealFilterChips();
       document.getElementById('dealSummaryTotal').textContent = fmt.format(total);
       document.getElementById('dealSummarySafe').textContent = fmt.format((summary.consensus || 0) + (summary.unanimous_three || 0));
       document.getElementById('dealSummaryAllThree').textContent = fmt.format(summary.all_three || 0);
@@ -6687,6 +7055,7 @@ DEALS_HTML = r"""<!doctype html>
       document.getElementById('prevButton').disabled = offset <= 0;
       document.getElementById('nextButton').disabled = offset + limit >= total;
       document.getElementById('emptyState').hidden = items.length > 0;
+      if (!items.length) document.getElementById('emptyState').innerHTML = dealEmptyContent();
       document.getElementById('lastUpdate').textContent = `updated ${new Date().toLocaleTimeString('__CS2_INTL_LOCALE__', { timeZone: 'Europe/Moscow' })} MSK`;
 
       document.getElementById('rowsBody').innerHTML = items.map((row, index) => {
@@ -6705,22 +7074,34 @@ DEALS_HTML = r"""<!doctype html>
             </div>
           </td>
           <td class="num-cell">${money(row.buy_price_cents)}</td>
-          <td><div class="model-stack">${modelCell(models.almaz, 'Almaz')}${modelCell(models.igor, 'Igor')}${modelCell(models.nova, 'Nova')}</div></td>
+          <td><div class="model-stack">${modelStack(row)}</div></td>
           <td>${detailsCell(row)}</td>
           <td>${timeCell(row)}</td>
-          <td>${linksCell(row)}</td>
         </tr>`;
       }).join('');
       document.getElementById('mobileDeals').innerHTML = items.length
         ? items.map((row, index) => mobileDealCard(row, index)).join('')
-        : '<div class="empty">No saved deals yet. Start `deal_scanner.py` and wait until it finds listings that pass the filters.</div>';
+        : `<div class="empty">${dealEmptyContent()}</div>`;
     }
 
-    async function refresh() {
+    async function refresh({ background = false } = {}) {
+      // Polling must let a slow filter request finish and preserve pending typing.
+      if (background && (dealRefreshController || dealSearchTimer !== null)) return;
+      clearTimeout(dealSearchTimer);
+      dealSearchTimer = null;
+      if (dealRefreshController) dealRefreshController.abort();
+      dealRefreshController = new AbortController();
+      const controller = dealRefreshController;
       const refreshId = ++latestRefresh;
       syncFilterState();
+      renderDealFilterChips();
+      document.getElementById('dealResultsStatus').textContent = dealUiText('Updating opportunities…');
+      document.getElementById('dealResultsStatus').dataset.tone = '';
+      document.getElementById('rowsBody').setAttribute('aria-busy', 'true');
       const search = document.getElementById('search').value.trim();
       const category = document.getElementById('categorySelect').value;
+      const assetType = document.getElementById('assetTypeSelect').value;
+      const discoverySource = document.getElementById('discoverySourceSelect').value;
       const confidence = document.getElementById('confidenceSelect').value;
       const listingType = document.getElementById('listingTypeSelect').value;
       const sort = document.getElementById('sortSelect').value;
@@ -6736,14 +7117,19 @@ DEALS_HTML = r"""<!doctype html>
         minStickerValue: document.getElementById('minStickerValue').value.trim(),
       };
       const url = `/api/model-deal-comparison?token=${encodeURIComponent(dashboardToken)}&offset=${offset}&limit=${limit}&category=${encodeURIComponent(category)}&confidence=${encodeURIComponent(confidence)}&listing_type=${encodeURIComponent(listingType)}&sort=${encodeURIComponent(sort)}&seen_hours=${encodeURIComponent(seenHours)}&created_hours=${encodeURIComponent(createdHours)}&min_price=${encodeURIComponent(minPrice)}&max_price=${encodeURIComponent(maxPrice)}&min_roi=${encodeURIComponent(thresholds.minRoi)}&min_profit=${encodeURIComponent(thresholds.minProfit)}&min_liquidity=${encodeURIComponent(thresholds.minLiquidity)}&max_float=${encodeURIComponent(thresholds.maxFloat)}&min_sticker_value=${encodeURIComponent(thresholds.minStickerValue)}&search=${encodeURIComponent(search)}`;
-      const response = await fetch(url, { cache: 'no-store' });
-      const data = await response.json();
-      if (refreshId !== latestRefresh) return;
-      if (!response.ok) {
-        throw new Error(data.error || response.statusText);
+      try {
+        const response = await fetch(`${url}&asset_type=${encodeURIComponent(assetType)}&discovery_source=${encodeURIComponent(discoverySource)}`, { cache: 'no-store', signal: controller.signal });
+        const data = await response.json();
+        if (refreshId !== latestRefresh) return;
+        if (!response.ok) throw new Error(data.error || response.statusText);
+        applyNormalizedFilterState(data, minPrice, maxPrice, thresholds);
+        render(data);
+      } catch (error) {
+        if (error.name !== 'AbortError' && refreshId === latestRefresh) showDealRefreshError(error);
+      } finally {
+        if (dealRefreshController === controller) dealRefreshController = null;
+        if (refreshId === latestRefresh) document.getElementById('rowsBody').setAttribute('aria-busy', 'false');
       }
-      applyNormalizedFilterState(data, minPrice, maxPrice, thresholds);
-      render(data);
     }
 
     document.getElementById('searchButton').addEventListener('click', () => {
@@ -6787,23 +7173,40 @@ DEALS_HTML = r"""<!doctype html>
       refresh().catch(error => { document.getElementById('lastUpdate').textContent = `error: ${error.message}`; });
     });
 
-    document.getElementById('resetFiltersButton').addEventListener('click', () => {
-      document.getElementById('search').value = '';
-      document.getElementById('categorySelect').value = 'all';
-      document.getElementById('confidenceSelect').value = 'all';
-      document.getElementById('listingTypeSelect').value = 'all';
-      document.getElementById('sortSelect').value = 'seen_new';
-      document.getElementById('seenSelect').value = '24';
-      document.getElementById('createdSelect').value = '0';
-      document.getElementById('minPrice').value = '';
-      document.getElementById('maxPrice').value = '';
-      document.getElementById('minRoi').value = '';
-      document.getElementById('minProfit').value = '';
-      document.getElementById('minLiquidity').value = '';
-      document.getElementById('maxFloat').value = '';
-      document.getElementById('minStickerValue').value = '';
+    document.getElementById('resetFiltersButton').addEventListener('click', resetDealFilters);
+    document.addEventListener('click', event => {
+      if (event.target.closest('[data-reset-deal-filters]')) resetDealFilters();
+    });
+    document.getElementById('dealActiveFilters').addEventListener('click', event => {
+      const button = event.target.closest('[data-clear-deal-filter]');
+      if (!button) return;
+      const param = button.dataset.clearDealFilter;
+      document.getElementById(filterStateFields[param]).value = dealFilterEmptyValues[param] || '';
       offset = 0;
-      refresh().catch(error => { document.getElementById('lastUpdate').textContent = `error: ${error.message}`; });
+      refresh().catch(showDealRefreshError);
+    });
+    document.getElementById('dealQuickFilters').addEventListener('click', event => {
+      const button = event.target.closest('[data-deal-preset]');
+      if (!button) return;
+      const remove = button.getAttribute('aria-pressed') === 'true';
+      for (const [param, value] of Object.entries(dealPresets[button.dataset.dealPreset])) {
+        document.getElementById(filterStateFields[param]).value = remove ? dealFilterEmptyValues[param] || '' : value;
+      }
+      offset = 0;
+      refresh().catch(showDealRefreshError);
+    });
+    ['assetTypeSelect', 'discoverySourceSelect'].forEach(id => {
+      document.getElementById(id).addEventListener('change', () => {
+        offset = 0;
+        refresh().catch(showDealRefreshError);
+      });
+    });
+    document.getElementById('search').addEventListener('input', () => {
+      clearTimeout(dealSearchTimer);
+      if (dealRefreshController) dealRefreshController.abort();
+      ++latestRefresh;
+      offset = 0;
+      dealSearchTimer = setTimeout(() => refresh().catch(showDealRefreshError), 350);
     });
 
     document.getElementById('viewSelect').addEventListener('change', applyViewMode);
@@ -6927,10 +7330,10 @@ DEALS_HTML = r"""<!doctype html>
     restoreFilterState();
     refresh().catch(error => { document.getElementById('lastUpdate').textContent = `error: ${error.message}`; });
     setInterval(() => {
-      if (!document.hidden) refresh().catch(() => {});
+      if (!document.hidden) refresh({ background: true }).catch(() => {});
     }, 15000);
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) refresh().catch(() => {});
+      if (!document.hidden) refresh({ background: true }).catch(() => {});
     });
   </script>
 </body>
@@ -7515,15 +7918,32 @@ STRATEGY_HTML = r"""<!doctype html>
       return Number.isFinite(number) ? number : null;
     }
 
+    const strategyMoneyFormat = new Intl.NumberFormat('__CS2_INTL_LOCALE__', {
+      style: 'currency',
+      currency: 'USD',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
+
     function money(cents) {
       const value = finite(cents);
-      return value === null ? '—' : `$${(value / 100).toFixed(2)}`;
+      return value === null ? '—' : strategyMoneyFormat.format(value / 100);
     }
 
     function percent(value, fraction = false) {
       const number = finite(value);
       if (number === null) return '—';
       return `${(fraction ? number * 100 : number).toFixed(1)}%`;
+    }
+
+    function priceBandLabel(value) {
+      const labels = {
+        under_20: 'сегмент до $20',
+        '20_100': 'сегмент $20–100',
+        '100_500': 'сегмент $100–500',
+        '500_plus': 'сегмент от $500',
+      };
+      return labels[value] || (value ? String(value) : 'без сегмента');
     }
 
     function days(value) {
@@ -7947,7 +8367,7 @@ STRATEGY_HTML = r"""<!doctype html>
         const weights = ensemble.weights || {};
         const url = safeExternalUrl(item.csfloat_url);
         return `<article class="risk-card">
-          <div class="risk-card-head"><div><h3 title="${escapeHtml(item.skin_name || '')}">${escapeHtml(item.skin_name || 'Неизвестный скин')}</h3><p class="section-copy">покупка ${money(item.buy_price_cents)} · ${escapeHtml((item.segment || {}).price_band || 'без сегмента')}</p></div><span class="risk-badge ${riskClass(risk.level)}">риск ${finite(risk.score) === null ? '—' : Number(risk.score).toFixed(0)}</span></div>
+          <div class="risk-card-head"><div><h3 title="${escapeHtml(item.skin_name || '')}">${escapeHtml(item.skin_name || 'Неизвестный скин')}</h3><p class="section-copy">покупка ${money(item.buy_price_cents)} · ${escapeHtml(priceBandLabel((item.segment || {}).price_band))}</p></div><span class="risk-badge ${riskClass(risk.level)}">риск ${finite(risk.score) === null ? '—' : Number(risk.score).toFixed(0)}</span></div>
           <div class="risk-stats"><div class="risk-stat"><span>Консервативная прибыль</span><strong class="${Number(ensemble.conservative_profit_cents || 0) >= 0 ? 'good-text' : 'bad-text'}">${money(ensemble.conservative_profit_cents)}</strong></div><div class="risk-stat"><span>Продажа за 30 дней</span><strong>${percent(sale.within_30d, true)}</strong></div><div class="risk-stat"><span>Оценка срока</span><strong>${days(sale.estimated_days)}</strong></div><div class="risk-stat"><span>Ожидаемая прибыль</span><strong>${money(ensemble.expected_profit_cents)}</strong></div></div>
           <div class="weight-row" aria-label="Динамические веса моделей">${Object.entries(weights).map(([model, weight]) => `<span class="weight-chip">${escapeHtml(model)} ${percent(weight, true)}</span>`).join('') || '<span class="weight-chip">веса недоступны</span>'}</div>
           <div class="rank-line"><span>ранг ${finite(item.ranking_score) === null ? '—' : Number(item.ranking_score).toFixed(1)} · веса: ${escapeHtml(ensemble.weight_source || 'равные')}</span>${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">Открыть</a>` : ''}</div>
@@ -8432,6 +8852,7 @@ PRIVATE_DESIGN_CSS = r"""
     .scanner-runtime-summary b { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
     .scanner-control-actions { display: grid; gap: 9px; min-width: 310px; }
     .scanner-control-actions > label { display: grid; gap: 5px; color: var(--muted); font-size: 11px; }
+    .scanner-control-help { color: var(--muted); font-size: 10px; line-height: 1.35; }
     .scanner-interval-input { display: grid; grid-template-columns: minmax(90px, 1fr) auto; align-items: center; gap: 8px; }
     .scanner-interval-input input { width: 100%; }
     .scanner-action-row { display: flex; gap: 8px; }
@@ -8466,13 +8887,32 @@ PRIVATE_DESIGN_CSS = r"""
     .scanner-profile-card strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .scanner-profile-card p { min-height: 34px; margin: 0; line-height: 1.4; }
     .scanner-profile-card-foot { display: flex; flex-wrap: wrap; gap: 5px; color: var(--muted); font-size: 10px; }
+    .scanner-profile-symbol { display: grid; place-items: center; width: 32px; height: 32px; border: 1px solid var(--accent-line); border-radius: 9px; background: var(--accent-soft); color: var(--accent); font-size: 20px; }
+    .scanner-profile-card.active { box-shadow: inset 0 0 0 1px var(--accent-line); }
+    .scanner-profile-card-foot > span:last-child:not(:empty) { color: var(--warn); }
     .scanner-target-editor { display: grid; gap: 12px; padding: 15px; border: 1px solid var(--line); border-radius: 13px; background: var(--subpanel-bg); }
     .scanner-target-editor h3 { margin: 4px 0 0; font-size: 17px; }
-    .scanner-target-toolbar { display: grid; grid-template-columns: 180px 160px minmax(220px, 1fr) auto; align-items: end; gap: 9px; }
+    .scanner-target-toolbar { display: grid; grid-template-columns: 155px 145px 125px 125px minmax(220px, 1fr) auto; align-items: end; gap: 9px; }
     .scanner-target-toolbar label:not(.scanner-target-enabled) { display: grid; gap: 5px; color: var(--muted); font-size: 10px; }
     .scanner-target-toolbar select, .scanner-target-toolbar input { width: 100%; max-width: none; }
     .scanner-target-enabled { display: flex; align-items: center; gap: 8px; min-height: 38px; color: var(--text); font-size: 11px; }
     .scanner-target-enabled input, .scanner-target-row-check { accent-color: var(--accent); }
+    .scanner-target-toolbar .scanner-target-enabled input, .scanner-target-row-check { width: 18px; min-width: 18px; height: 18px; min-height: 18px; padding: 0; flex: 0 0 18px; }
+    .scanner-sticker-groups {
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) auto auto auto;
+      align-items: end;
+      gap: 9px;
+      padding: 11px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: color-mix(in srgb, var(--control-bg) 72%, transparent);
+    }
+    .scanner-sticker-groups[hidden] { display: none; }
+    .scanner-sticker-groups label { display: grid; gap: 5px; color: var(--muted); font-size: 10px; }
+    .scanner-sticker-groups select { width: 100%; max-width: none; }
+    .scanner-sticker-group-chips { display: flex; flex-wrap: wrap; gap: 6px; grid-column: 1 / -1; }
+    .scanner-sticker-groups > small { grid-column: 1 / -1; color: var(--muted); line-height: 1.4; }
     .scanner-target-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
     .scanner-target-summary > span { display: grid; gap: 2px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 9px; }
     .scanner-target-summary small { color: var(--muted); font-size: 9px; }
@@ -8482,6 +8922,16 @@ PRIVATE_DESIGN_CSS = r"""
     .scanner-target-scroll { max-height: 440px; border: 1px solid var(--line); border-radius: 10px; }
     .scanner-target-scroll table { margin: 0; }
     .scanner-target-name { display: grid; gap: 3px; }
+    .scanner-target-name { cursor: pointer; padding: 5px 0; }
+    .scanner-target-row-check { width: 18px; height: 18px; min-width: 18px; cursor: pointer; }
+    .scanner-target-scroll tr.scanner-target-selected { background: var(--accent-soft); }
+    .scanner-target-scroll tr:hover { background: color-mix(in srgb, var(--accent) 9%, var(--panel)); }
+    .scanner-target-scroll th { position: sticky; top: 0; z-index: 1; }
+    .scanner-target-empty { padding: 32px 16px; text-align: center; color: var(--muted); }
+    .scanner-selection-toolbar, .scanner-selection-tabs { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .scanner-selection-toolbar { justify-content: space-between; }
+    .scanner-selection-toolbar > .muted, .scanner-selection-hint { font-size: 11px; }
+    .scanner-selection-hint { color: var(--muted); }
     .scanner-target-name small { color: var(--muted); overflow-wrap: anywhere; }
     .scanner-target-pages { justify-content: flex-end; }
     .scanner-target-pages .pill { min-width: 130px; text-align: center; }
@@ -8573,6 +9023,38 @@ PRIVATE_DESIGN_CSS = r"""
     .filter-field select, .filter-field input { width: 100%; max-width: none; }
     .filter-grid { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 12px; align-items: end; }
     .filter-grid .button { align-self: end; }
+    .filter-chip { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 34px; padding: 6px 12px; border: 1px solid var(--line); border-radius: 999px; background: var(--control-bg); color: var(--muted); cursor: pointer; font: inherit; font-size: 11px; text-align: left; transition: border-color 150ms ease, background 150ms ease; }
+    .filter-chip:hover { color: var(--text); border-color: var(--accent-line); }
+    .filter-chip.active { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
+    .filter-chip b { color: var(--text); font-weight: 650; }
+    .filter-chip:disabled { cursor: wait; opacity: .55; }
+    .filter-chip:focus-visible, .scanner-profile-card:focus-visible, .scanner-target-row-check:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    .deal-quick-filters, .deal-active-filters, .deal-active-filter-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .deal-quick-filters > .muted { margin-right: 4px; font-size: 11px; }
+    .deal-active-filter-bar { justify-content: space-between; padding-top: 4px; }
+    .deal-active-filters { flex: 1; min-width: 0; }
+    .deal-active-filters > .muted { font-size: 11px; }
+    .filter-chip-removable { min-height: 30px; padding: 4px 10px; background: var(--accent-soft); }
+    .filter-chip-removable > span:first-child { overflow-wrap: anywhere; }
+    .filter-count { display: inline-grid; place-items: center; min-width: 24px; min-height: 24px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 11px; }
+    .deal-results-status { min-height: 17px; color: var(--muted); font-size: 11px; }
+    .deal-results-status[data-tone="bad"] { color: var(--bad); }
+    .deal-view-control { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; }
+    .deal-view-control select { min-width: 110px; }
+    .page-deals .empty { display: grid; justify-items: center; gap: 10px; padding: 44px 20px; text-align: center; }
+    .page-deals .empty[hidden] { display: none; }
+    .page-deals .empty strong { color: var(--text); font-size: 16px; }
+    .page-deals .empty p { max-width: 520px; margin: 0 0 8px; }
+    .deal-empty-icon { display: grid; place-items: center; width: 48px; height: 48px; border-radius: 14px; background: var(--accent-soft); color: var(--accent); font-size: 30px; }
+    .page-deals .model-box { padding: 10px 12px; border: 1px solid var(--line); border-left: 3px solid var(--line); border-radius: 10px; background: var(--subpanel-bg); font-size: 11px; }
+    .page-deals .model-box[data-verdict="good"] { border-left-color: var(--good); }
+    .page-deals .model-box[data-verdict="watch"] { border-left-color: var(--warn); }
+    .page-deals .model-box[data-verdict="bad"] { border-left-color: var(--bad); }
+    .page-deals .model-box[data-model="vega"] { border-left-color: var(--accent); }
+    .page-deals .model-title { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 5px; font-size: 12px; }
+    .page-deals .model-box-missing { opacity: .65; }
+    .page-deals .model-box-missing .model-title { font-size: 11px; }
+    .page-deals .deal-card-section .model-stack { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
     .pagination-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     .pagination-bar > div { display: flex; gap: 7px; }
     .deal-summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-bottom: 1px solid var(--line); }
@@ -8648,6 +9130,7 @@ PRIVATE_DESIGN_CSS = r"""
       .scanner-control-layout { grid-template-columns: 1fr; gap: 20px; }
       .scanner-control-actions { width: 100%; min-width: 0; }
       .scanner-target-toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .scanner-sticker-groups { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .model-health-grid { grid-template-columns: 1fr; }
     }
     @media (max-width: 620px) {
@@ -8673,6 +9156,7 @@ PRIVATE_DESIGN_CSS = r"""
       .section-actions { width: 100%; }
       .section-actions > input, .section-actions > select, .section-actions > .control { width: 100%; max-width: none; }
       .section-actions .button { flex: 1 1 90px; }
+      .scanner-sticker-groups { grid-template-columns: 1fr; }
       .page-deal .form-grid { grid-template-columns: 1fr; }
       .page-deal .wide { grid-column: auto; }
       .comparison-callout { align-items: flex-start; flex-direction: column; gap: 8px; }
@@ -8689,6 +9173,25 @@ PRIVATE_DESIGN_CSS = r"""
       .scanner-action-row { flex-direction: column; }
       .scanner-profile-grid, .scanner-target-summary, .scanner-target-toolbar { grid-template-columns: 1fr; }
       .scanner-target-head, .scanner-target-editor-head { align-items: flex-start; flex-direction: column; }
+      .scanner-target-scroll table, .scanner-target-scroll tbody { display: block; width: 100%; min-width: 0; }
+      .scanner-target-scroll thead { display: none; }
+      .scanner-target-scroll tbody tr { display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 3px 8px; padding: 12px; border-bottom: 1px solid var(--line); }
+      .scanner-target-scroll tbody tr:last-child { border-bottom: 0; }
+      .scanner-target-scroll tbody td { display: block; width: auto; padding: 0; border: 0; white-space: normal; overflow: visible; overflow-wrap: anywhere; }
+      .scanner-target-scroll tbody td:first-child { grid-column: 1; grid-row: 1 / 4; padding-top: 5px; }
+      .scanner-target-scroll tbody td:not(:first-child) { grid-column: 2; }
+      .scanner-target-scroll tbody td:nth-child(n + 3) { color: var(--muted); font-size: 10px; }
+      .scanner-target-scroll tbody td.scanner-target-empty { grid-column: 1 / -1; padding: 16px 0; }
+      .scanner-target-name strong { white-space: normal; overflow-wrap: anywhere; }
+      .scanner-target-name small { font-size: 9px; }
+      .scanner-profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .scanner-profile-card-head { align-items: flex-start; flex-direction: column; }
+      .scanner-profile-card strong { white-space: normal; }
+      .scanner-profile-card p { font-size: 10px; }
+      .scanner-target-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .scanner-target-bulk .button { flex: 1 1 140px; }
+      .scanner-target-bulk .scanner-feedback { flex-basis: 100%; }
+      .deal-active-filter-bar > .button { width: 100%; }
       .pagination-bar { align-items: stretch; flex-direction: column; }
       .pagination-bar > div { display: grid; grid-template-columns: 1fr 1fr; }
       .page-deals .section-head .pill { width: auto; align-self: flex-start; }
@@ -8923,20 +9426,61 @@ LEAN_INTERFACE_SCRIPT = r"""
 """
 
 
-def json_response(handler, status, payload, *, extra_headers=None):
-    body = json.dumps(payload, ensure_ascii=False, default=json_default).encode("utf-8")
+def client_accepts_gzip(handler):
+    headers = getattr(handler, "headers", None)
+    try:
+        accepted = str(headers.get("Accept-Encoding", "") if headers else "")
+    except AttributeError:
+        return False
+    for token in accepted.lower().split(","):
+        coding, _, params = token.strip().partition(";")
+        if coding.strip() == "gzip":
+            return params.replace(" ", "") not in {"q=0", "q=0.0", "q=0.00", "q=0.000"}
+    return False
+
+
+def send_text_body(handler, status, body, content_type, *, extra_headers=None):
+    """Send a complete text response, gzip-compressed when the client allows.
+
+    Private pages embed their scripts, styles and the i18n catalogue inline, so
+    one page is 250-400 KB of highly repetitive text.  Compressing it cuts the
+    transfer through the reverse tunnel by roughly an order of magnitude.
+    """
+
+    encoded = body if isinstance(body, bytes) else str(body).encode("utf-8")
+    compressed = len(encoded) >= GZIP_MIN_BYTES and client_accepts_gzip(handler)
+    if compressed:
+        encoded = gzip.compress(encoded, compresslevel=GZIP_COMPRESS_LEVEL, mtime=0)
     handler.send_response(status)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Type", content_type)
     handler.send_header("Cache-Control", "no-store")
     send_security_headers(handler)
     for name, value in extra_headers or ():
         handler.send_header(str(name), str(value))
-    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Vary", "Accept-Encoding")
+    if compressed:
+        handler.send_header("Content-Encoding", "gzip")
+    handler.send_header("Content-Length", str(len(encoded)))
     handler.end_headers()
     try:
-        handler.wfile.write(body)
+        handler.wfile.write(encoded)
     except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
         pass
+
+
+def html_body_response(handler, document, *, status=200):
+    send_text_body(handler, status, document, "text/html; charset=utf-8")
+
+
+def json_response(handler, status, payload, *, extra_headers=None):
+    body = json.dumps(payload, ensure_ascii=False, default=json_default).encode("utf-8")
+    send_text_body(
+        handler,
+        status,
+        body,
+        "application/json; charset=utf-8",
+        extra_headers=extra_headers,
+    )
 
 
 def json_default(value):
@@ -9453,6 +9997,7 @@ def _admin_user_payload(user):
         "password_reset_sent_at": user.get("password_reset_sent_at"),
         "sessions": sessions,
         "recent_sessions": sessions,
+        "database_downloads": user.get("database_downloads", {}),
         "can_manage": user.get("access_state") != "deleted",
         "is_self": False,
     }
@@ -9499,6 +10044,7 @@ def build_admin_users_payload(query):
     return {
         "users": users,
         "summary": summary,
+        "unattributed_downloads": result.get("unattributed_downloads", {}),
         "total": result.get("total", len(users)),
         "limit": result.get("limit", limit),
         "offset": result.get("offset", offset),
@@ -9707,7 +10253,9 @@ def simplify_private_interface(document, locale=web_i18n.DEFAULT_LOCALE, *, page
     rendered = str(document)
     for old_brand in ("CS2 Intelligence", "CS2 Market Lab", "CSSkinsPrediction"):
         rendered = rendered.replace(old_brand, "CS2 Market")
-    include_system = page == "dashboard" or 'class="page-dashboard"' in rendered
+    include_system = (
+        page in {"dashboard", "admin-users"} or 'class="page-dashboard"' in rendered
+    )
     header_nav = re.compile(
         r"(?is)(<header\b[^>]*>.*?)(<nav\b[^>]*>.*?</nav>)"
     )
@@ -9717,7 +10265,7 @@ def simplify_private_interface(document, locale=web_i18n.DEFAULT_LOCALE, *, page
         count=1,
     )
     if count == 0:
-        return rendered
+        return web_theme.inject_theme(rendered, page=page)
     if page and f"page-{page}" not in rendered:
         rendered = re.sub(
             r"<body(?P<attrs>[^>]*)>",
@@ -9742,7 +10290,7 @@ def simplify_private_interface(document, locale=web_i18n.DEFAULT_LOCALE, *, page
         rendered = rendered.replace("</head>", f"{LEAN_INTERFACE_CSS}</head>", 1)
     if 'id="cs2-lean-interface-script"' not in rendered and "</body>" in rendered:
         rendered = rendered.replace("</body>", f"{LEAN_INTERFACE_SCRIPT}</body>", 1)
-    return rendered
+    return web_theme.inject_theme(rendered, page=page)
 
 
 def inject_knives_navigation(document, locale=web_i18n.DEFAULT_LOCALE):
@@ -9873,10 +10421,14 @@ def inject_market_history_navigation(document, locale=web_i18n.DEFAULT_LOCALE):
 
 
 def standalone_html_response(handler, document, *, status=200):
-    body = document.encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", "text/html; charset=utf-8")
-    handler.send_header("Cache-Control", "no-store")
+    html_body_response(handler, document, status=status)
+
+
+def favicon_response(handler):
+    body = web_theme.FAVICON_SVG.encode("utf-8")
+    handler.send_response(200)
+    handler.send_header("Content-Type", "image/svg+xml")
+    handler.send_header("Cache-Control", "public, max-age=604800")
     send_security_headers(handler)
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
@@ -9899,7 +10451,7 @@ def auth_html_response(handler, mode):
     document = account_ui.render_auth_page(mode, locale).replace(
         "CSSkinsPrediction", "CS2 Market"
     )
-    standalone_html_response(handler, document)
+    standalone_html_response(handler, web_theme.inject_theme(document, page="auth"))
 
 
 def account_html_response(handler):
@@ -9913,10 +10465,10 @@ def account_html_response(handler):
 
 def admin_users_html_response(handler):
     locale = web_i18n.request_locale(handler)
-    standalone_html_response(
-        handler,
-        admin_users_ui.render_admin_users_page(locale),
+    document = simplify_private_interface(
+        admin_users_ui.render_admin_users_page(locale), locale, page="admin-users"
     )
+    standalone_html_response(handler, local_owner_document(handler, document, locale))
 
 
 def knives_html_response(handler):
@@ -9955,17 +10507,7 @@ def html_response(handler, token=None):
         .replace("__LIVE_REFRESH_MS__", str(LIVE_REFRESH_MS))
     )
     html = local_owner_document(handler, html, locale)
-    body = html.encode("utf-8")
-    handler.send_response(200)
-    handler.send_header("Content-Type", "text/html; charset=utf-8")
-    handler.send_header("Cache-Control", "no-store")
-    send_security_headers(handler)
-    handler.send_header("Content-Length", str(len(body)))
-    handler.end_headers()
-    try:
-        handler.wfile.write(body)
-    except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
-        pass
+    html_body_response(handler, html)
 
 
 def deal_html_response(handler, token=None):
@@ -9973,17 +10515,7 @@ def deal_html_response(handler, token=None):
     html = local_owner_document(
         handler, render_private_html(DEAL_HTML, locale), locale
     )
-    body = html.encode("utf-8")
-    handler.send_response(200)
-    handler.send_header("Content-Type", "text/html; charset=utf-8")
-    handler.send_header("Cache-Control", "no-store")
-    send_security_headers(handler)
-    handler.send_header("Content-Length", str(len(body)))
-    handler.end_headers()
-    try:
-        handler.wfile.write(body)
-    except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
-        pass
+    html_body_response(handler, html)
 
 
 def build_neural_template():
@@ -10012,17 +10544,7 @@ def neural_html_response(handler, token=None):
     # Localisation is deliberately the final step, so translated copy can
     # never make structural Nova replacements stop matching.
     html = render_private_html(build_neural_template(), locale)
-    body = html.encode("utf-8")
-    handler.send_response(200)
-    handler.send_header("Content-Type", "text/html; charset=utf-8")
-    handler.send_header("Cache-Control", "no-store")
-    send_security_headers(handler)
-    handler.send_header("Content-Length", str(len(body)))
-    handler.end_headers()
-    try:
-        handler.wfile.write(body)
-    except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
-        pass
+    html_body_response(handler, html)
 
 
 def deals_html_response(handler, token=None):
@@ -10030,34 +10552,14 @@ def deals_html_response(handler, token=None):
     html = local_owner_document(
         handler, render_private_html(DEALS_HTML, locale), locale
     )
-    body = html.encode("utf-8")
-    handler.send_response(200)
-    handler.send_header("Content-Type", "text/html; charset=utf-8")
-    handler.send_header("Cache-Control", "no-store")
-    send_security_headers(handler)
-    handler.send_header("Content-Length", str(len(body)))
-    handler.end_headers()
-    try:
-        handler.wfile.write(body)
-    except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
-        pass
+    html_body_response(handler, html)
 
 
 def strategy_html_response(handler, token=None):
     locale = web_i18n.request_locale(handler)
-    body = local_owner_document(
+    html_body_response(handler, local_owner_document(
         handler, render_private_html(STRATEGY_HTML, locale), locale
-    ).encode("utf-8")
-    handler.send_response(200)
-    handler.send_header("Content-Type", "text/html; charset=utf-8")
-    handler.send_header("Cache-Control", "no-store")
-    send_security_headers(handler)
-    handler.send_header("Content-Length", str(len(body)))
-    handler.end_headers()
-    try:
-        handler.wfile.write(body)
-    except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
-        pass
+    ))
 
 
 def escape_html(value):
@@ -10136,10 +10638,15 @@ def build_public_payload():
     payload["top_weapons"] = (static_payload.get("top_weapons") or [])[:6]
     payload["top_stickers"] = (static_payload.get("top_stickers") or [])[:6]
 
+    heavy = None
     try:
+        heavy = get_dashboard_heavy_payload()
+        if heavy is not None:
+            payload["overview"] = heavy["overview"]
         with connect_db() as conn:
-            payload["overview"] = fetch_overview(conn)
-            payload["recent_sales"] = fetch_recent_sales(conn, 4)
+            # The landing page shows four distinct skins; consecutive sales of
+            # one popular skin used to collapse the gallery to a single tile.
+            payload["recent_sales"] = fetch_recent_sales(conn, 200)
             if table_exists(conn, "model_deal_predictions"):
                 payload["deal_count"] = conn.execute("""
                     SELECT COUNT(DISTINCT listing_id)
@@ -10149,6 +10656,10 @@ def build_public_payload():
     except sqlite3.Error:
         pass
 
+    if heavy is None:
+        # Startup warm-up is still counting; do not pin zero counters for a
+        # whole cache period.
+        return payload
     return cache_set("public_payload", payload)
 
 
@@ -10221,19 +10732,11 @@ def public_html_response(handler):
         .replace("__TOP_STICKERS__", top_stickers)
         .replace("CSSkinsPrediction", "CS2 Market")
     )
-    html_body = web_i18n.render_document(html_body, locale)
+    html_body = web_theme.inject_theme(
+        web_i18n.render_document(html_body, locale), page="public"
+    )
 
-    body = html_body.encode("utf-8")
-    handler.send_response(200)
-    handler.send_header("Content-Type", "text/html; charset=utf-8")
-    handler.send_header("Cache-Control", "no-store")
-    send_security_headers(handler)
-    handler.send_header("Content-Length", str(len(body)))
-    handler.end_headers()
-    try:
-        handler.wfile.write(body)
-    except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
-        pass
+    html_body_response(handler, html_body)
 
 
 def create_db_snapshot():
@@ -10271,27 +10774,54 @@ def create_db_snapshot():
     return temp_file.name
 
 
-def file_response(handler, path, download_name, content_type):
+def file_response(handler, path, download_name, content_type, *, progress_callback=None):
+    """Stream a file and report bytes accepted by the server socket.
+
+    A completed response does not prove that the browser saved the file.
+    Persist progress at most once per second, and always report the final count.
+    """
     file_path = Path(path)
-    size = file_path.stat().st_size
-
-    handler.send_response(200)
-    handler.send_header("Content-Type", content_type)
-    handler.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
-    handler.send_header("Cache-Control", "no-store")
-    send_security_headers(handler)
-    handler.send_header("Content-Length", str(size))
-    handler.end_headers()
-
-    try:
-        with file_path.open("rb") as file:
-            while True:
-                chunk = file.read(1024 * 1024)
+    with file_path.open("rb") as file:
+        size = os.fstat(file.fileno()).st_size
+        bytes_sent = 0
+        status = "failed"
+        if progress_callback:
+            progress_callback("downloading", bytes_sent, size)
+        last_update = time.monotonic()
+        try:
+            # The route must never append a JSON error to a binary response.
+            handler._file_response_started = True
+            handler.send_response(200)
+            handler.send_header("Content-Type", content_type)
+            handler.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+            handler.send_header("Cache-Control", "no-store")
+            handler.send_header("X-Accel-Buffering", "no")
+            send_security_headers(handler)
+            handler.send_header("Content-Length", str(size))
+            handler.end_headers()
+            while bytes_sent < size:
+                chunk = file.read(min(DATABASE_DOWNLOAD_CHUNK_BYTES, size - bytes_sent))
                 if not chunk:
-                    break
-                handler.wfile.write(chunk)
-    except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
-        pass
+                    raise OSError("database snapshot ended before its declared size")
+                remaining = memoryview(chunk)
+                while remaining:
+                    written = handler.wfile.write(remaining)
+                    if written is None or written <= 0 or written > len(remaining):
+                        raise OSError("incomplete database response write")
+                    bytes_sent += written
+                    remaining = remaining[written:]
+                    current_time = time.monotonic()
+                    if progress_callback and current_time - last_update >= DATABASE_DOWNLOAD_PROGRESS_INTERVAL:
+                        progress_callback("downloading", bytes_sent, size)
+                        last_update = current_time
+            handler.wfile.flush()
+            status = "completed"
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, TimeoutError):
+            status = "interrupted"
+            handler.close_connection = True
+        finally:
+            if progress_callback:
+                progress_callback(status, bytes_sent, size)
 
 
 def read_json_file(path, default):
@@ -10345,9 +10875,17 @@ def build_health_payload():
             app_config.PROJECT_DIR / "NEURALMODEL" / "artifacts",
             "nova_price_model.pt",
         ),
+        "vega": (
+            app_config.PROJECT_DIR / "VEGAMODEL" / "artifacts",
+            "vega_price_model.pt",
+        ),
         "knives": (
             app_config.PROJECT_DIR / "KNIFEMODEL" / "artifacts",
             "knife_price_model.joblib",
+        ),
+        "gloves": (
+            app_config.PROJECT_DIR / "GLOVEMODEL" / "artifacts",
+            "glove_price_model.joblib",
         ),
     }
     model_available = {}
@@ -10726,6 +11264,7 @@ def build_model_freshness(conn, current_sales_count, project_dir=None):
         "almaz": project_dir / "models",
         "igor": project_dir / "IGORMODEL" / "artifacts",
         "nova": project_dir / "NEURALMODEL" / "artifacts",
+        "vega": project_dir / "VEGAMODEL" / "artifacts",
         "knives": project_dir / "KNIFEMODEL" / "artifacts",
         "gloves": project_dir / "GLOVEMODEL" / "artifacts",
     }
@@ -10768,6 +11307,10 @@ def build_model_freshness(conn, current_sales_count, project_dir=None):
         "nova": {
             "artifact_name": "nova_price_model.pt",
             "metrics_names": ["nova_metrics.json"],
+        },
+        "vega": {
+            "artifact_name": "vega_price_model.pt",
+            "metrics_names": ["vega_metrics.json"],
         },
         "knives": {
             "artifact_name": "knife_price_model.joblib",
@@ -11758,19 +12301,17 @@ def deal_scanner_default_interval_seconds():
         value = int(value)
     except (TypeError, ValueError):
         return scanner_control.DEFAULT_INTERVAL_SECONDS
-    if not scanner_control.MIN_INTERVAL_SECONDS <= value <= scanner_control.MAX_INTERVAL_SECONDS:
+    if value != 0 and not (
+        scanner_control.MIN_NONZERO_INTERVAL_SECONDS
+        <= value
+        <= scanner_control.MAX_INTERVAL_SECONDS
+    ):
         return scanner_control.DEFAULT_INTERVAL_SECONDS
     return value
 
 
 def process_is_alive(pid):
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except (OSError, ValueError):
-        return False
-    return True
+    return portable_os.process_alive(pid)
 
 
 def build_scanner_control_payload(*, now=None):
@@ -11834,6 +12375,7 @@ def build_scanner_control_payload(*, now=None):
         "health": health,
         "limits": {
             "min_interval_seconds": scanner_control.MIN_INTERVAL_SECONDS,
+            "min_nonzero_interval_seconds": scanner_control.MIN_NONZERO_INTERVAL_SECONDS,
             "max_interval_seconds": scanner_control.MAX_INTERVAL_SECONDS,
             "default_interval_seconds": deal_scanner_default_interval_seconds(),
         },
@@ -11870,6 +12412,7 @@ def scanner_control_update_fallback(control, *, now=None):
         "health": "status_unavailable",
         "limits": {
             "min_interval_seconds": scanner_control.MIN_INTERVAL_SECONDS,
+            "min_nonzero_interval_seconds": scanner_control.MIN_NONZERO_INTERVAL_SECONDS,
             "max_interval_seconds": scanner_control.MAX_INTERVAL_SECONDS,
             "default_interval_seconds": deal_scanner_default_interval_seconds(),
         },
@@ -11896,10 +12439,14 @@ def update_scanner_control_from_payload(payload):
         interval = payload["interval_seconds"]
         if isinstance(interval, bool) or not isinstance(interval, int):
             raise ValueError("interval_seconds must be an integer")
-        if not scanner_control.MIN_INTERVAL_SECONDS <= interval <= scanner_control.MAX_INTERVAL_SECONDS:
+        if interval != 0 and not (
+            scanner_control.MIN_NONZERO_INTERVAL_SECONDS
+            <= interval
+            <= scanner_control.MAX_INTERVAL_SECONDS
+        ):
             raise ValueError(
-                "interval_seconds must be between "
-                f"{scanner_control.MIN_INTERVAL_SECONDS} and "
+                "interval_seconds must be 0 or between "
+                f"{scanner_control.MIN_NONZERO_INTERVAL_SECONDS} and "
                 f"{scanner_control.MAX_INTERVAL_SECONDS}"
             )
         changes["interval_seconds"] = interval
@@ -11997,15 +12544,38 @@ def scanner_mutation_request_violation(handler, expected_action):
 
 
 def _pending_model_training_eligibility():
-    return {
-        model: {
+    pending = {}
+    for model in model_training_jobs.MODEL_NAMES:
+        item_kind = (
+            ITEM_KIND_KNIFE
+            if model == "knives"
+            else ITEM_KIND_GLOVE
+            if model == "gloves"
+            else ITEM_KIND_WEAPON_SKIN
+        )
+        bootstrap = model in {"knives", "gloves", "vega"}
+        if model == "knives":
+            min_rows = model_training_jobs.KNIFE_BOOTSTRAP_MIN_ROWS
+            min_runtime_rows = (
+                model_training_jobs.KNIFE_BOOTSTRAP_MIN_RUNTIME_VALID_ROWS
+            )
+        elif model == "gloves":
+            min_rows = model_training_jobs.GLOVE_BOOTSTRAP_MIN_ROWS
+            min_runtime_rows = (
+                model_training_jobs.GLOVE_BOOTSTRAP_MIN_RUNTIME_VALID_ROWS
+            )
+        elif model == "vega":
+            min_rows = model_training_jobs.VEGA_BOOTSTRAP_MIN_ROWS
+            min_runtime_rows = (
+                model_training_jobs.VEGA_BOOTSTRAP_MIN_RUNTIME_VALID_ROWS
+            )
+        else:
+            min_rows = model_training_jobs.MIN_NEW_ROWS
+            min_runtime_rows = model_training_jobs.MIN_RUNTIME_VALID_NEW_ROWS
+        pending[model] = {
             "model": model,
-            "item_kind": (
-                ITEM_KIND_KNIFE
-                if model == "knives"
-                else ITEM_KIND_WEAPON_SKIN
-            ),
-            "bootstrap": model == "knives",
+            "item_kind": item_kind,
+            "bootstrap": bootstrap,
             "eligible": False,
             "reasons": ["eligibility_refreshing"],
             "trained_rows": None,
@@ -12016,21 +12586,12 @@ def _pending_model_training_eligibility():
             "runtime_valid_new_rows": 0,
             "trainer_available": True,
             "thresholds": {
-                "min_new_rows": (
-                    model_training_jobs.KNIFE_BOOTSTRAP_MIN_ROWS
-                    if model == "knives"
-                    else model_training_jobs.MIN_NEW_ROWS
-                ),
+                "min_new_rows": min_rows,
                 "min_growth_percent": model_training_jobs.MIN_DATA_GROWTH_PERCENT,
-                "min_runtime_valid_new_rows": (
-                    model_training_jobs.KNIFE_BOOTSTRAP_MIN_RUNTIME_VALID_ROWS
-                    if model == "knives"
-                    else model_training_jobs.MIN_RUNTIME_VALID_NEW_ROWS
-                ),
+                "min_runtime_valid_new_rows": min_runtime_rows,
             },
         }
-        for model in model_training_jobs.MODEL_NAMES
-    }
+    return pending
 
 
 def _refresh_model_training_eligibility_cache():
@@ -12217,6 +12778,8 @@ def fetch_model_deal_comparison_page(
     max_float=None,
     min_sticker_value=None,
     opinion_stale_hours=None,
+    asset_type="all",
+    discovery_source="all",
 ):
     limit = min(max(int(limit), 1), 100)
     offset = min(max(int(offset), 0), MAX_SAFE_PAGE_OFFSET)
@@ -12226,6 +12789,12 @@ def fetch_model_deal_comparison_page(
     listing_type = (listing_type or "all").strip()
     sort_mode = (sort_mode or "seen_new").strip()
     confidence = (confidence or "all").strip()
+    asset_type = (asset_type or "all").strip()
+    if asset_type not in {"all", "weapon_skin", "knife", "glove"}:
+        asset_type = "all"
+    discovery_source = (discovery_source or "all").strip()
+    if discovery_source not in {"all", "sticker", "liquid_skin", "knife", "glove"}:
+        discovery_source = "all"
     if confidence not in DEAL_CONFIDENCE_FILTERS:
         confidence = "all"
     if opinion_stale_hours is None:
@@ -12277,12 +12846,14 @@ def fetch_model_deal_comparison_page(
             "total": 0,
             "rows": [],
             "summary": {
-                "all": 0, "almaz": 0, "igor": 0, "nova": 0, "both": 0,
+                "all": 0, "almaz": 0, "igor": 0, "nova": 0, "vega": 0, "both": 0,
                 "all_three": 0, "only_almaz": 0, "only_igor": 0, "only_nova": 0,
                 "consensus": 0, "unanimous_three": 0,
                 "disagreement": 0, "single_signal": 0,
             },
             "confidence": confidence,
+            "asset_type": asset_type,
+            "discovery_source": discovery_source,
             "min_roi_percent": min_roi_percent,
             "min_profit_cents": min_profit_cents,
             "min_liquidity_score": min_liquidity_score,
@@ -12312,8 +12883,42 @@ def fetch_model_deal_comparison_page(
             params.append(pattern)
         where_parts.append(f"({' OR '.join(search_parts)})")
 
+    if discovery_source != "all":
+        # Select listings, not individual model opinions: a second discovery
+        # route must not hide a dissenting model or duplicate the result.
+        source_parts = []
+        if "source_type" in prediction_columns:
+            source_parts.append(
+                "EXISTS (SELECT 1 FROM model_deal_predictions AS source_prediction "
+                "WHERE source_prediction.listing_id = model_deal_predictions.listing_id "
+                "AND COALESCE(source_prediction.source_type, 'sticker') = ?)"
+            )
+            params.append(discovery_source)
+        elif discovery_source == "sticker":
+            source_parts.append("1 = 1")
+        if table_exists(conn, "model_deal_listing_sources"):
+            source_parts.append(
+                "EXISTS (SELECT 1 FROM model_deal_listing_sources AS listing_source "
+                "WHERE listing_source.listing_id = model_deal_predictions.listing_id "
+                "AND listing_source.source_type = ?)"
+            )
+            params.append(discovery_source)
+        where_parts.append(f"({' OR '.join(source_parts)})" if source_parts else "0 = 1")
+
+    # A listing without a positive decision model can never reach the page.
+    # Select those IDs first, while retaining every matching opinion (including
+    # dissent and advisory models) for the actual comparison below.
+    advisory_placeholders = ",".join("?" for _ in DEAL_ADVISORY_MODEL_NAMES)
+    where_parts.append(f"""
+        listing_id IN (
+            SELECT listing_id FROM model_deal_predictions
+            WHERE verdict IN ('good', 'watch') AND last_seen_at >= ?
+                AND model_name NOT IN ({advisory_placeholders})
+        )
+    """)
+    params.extend([opinion_cutoff.isoformat(), *sorted(DEAL_ADVISORY_MODEL_NAMES)])
     where_sql = f"WHERE {' AND '.join(where_parts)}"
-    prediction_rows = [
+    prediction_rows = (
         dict(row)
         for row in conn.execute(f"""
             SELECT *
@@ -12321,7 +12926,7 @@ def fetch_model_deal_comparison_page(
             {where_sql}
             ORDER BY last_seen_at DESC, roi_percent DESC, profit_cents DESC
         """, params)
-    ]
+    )
 
     def finite_float_value(value):
         if value is None:
@@ -12350,6 +12955,7 @@ def fetch_model_deal_comparison_page(
         return max(finite_values) if finite_values else None
 
     grouped = {}
+    sticker_predictions = {}
     for prediction_row in prediction_rows:
         listing_id = prediction_row["listing_id"]
         item = grouped.setdefault(listing_id, {
@@ -12363,30 +12969,25 @@ def fetch_model_deal_comparison_page(
         raw_payload = prediction_row.pop("deal_payload_json", None)
         raw_prediction = prediction_row.pop("prediction_json", None)
         payload = {}
-        prediction_payload = {}
-        if raw_payload:
+        if raw_payload and not item["payload"]:
             try:
                 payload = json.loads(raw_payload)
             except (TypeError, json.JSONDecodeError):
                 payload = {}
-        if raw_prediction:
-            try:
-                prediction_payload = json.loads(raw_prediction)
-            except (TypeError, json.JSONDecodeError):
-                prediction_payload = {}
 
         model_name = prediction_row["model_name"]
         item["models"][model_name] = prediction_row
 
         if payload and not item["payload"]:
             item["payload"] = payload
-            item["stickers"] = (
-                prediction_payload.get("stickers")
-                or payload.get("stickers")
-                or []
-            )
+            # Stickers are display data: decode the selected opinion only for
+            # the final page, not every model for every candidate listing.
+            sticker_predictions[listing_id] = raw_prediction
 
-        if prediction_row.get("verdict") in DEAL_POSITIVE_VERDICTS:
+        if (
+            model_name not in DEAL_ADVISORY_MODEL_NAMES
+            and prediction_row.get("verdict") in DEAL_POSITIVE_VERDICTS
+        ):
             best = item["best"]
             candidate_score = model_score(prediction_row)
             if best is None or candidate_score > model_score(best):
@@ -12395,39 +12996,72 @@ def fetch_model_deal_comparison_page(
     seen_cutoff = now - timedelta(hours=seen_hours) if seen_hours else None
     created_cutoff = now - timedelta(hours=created_hours) if created_hours else None
     rows = []
+    item_kind_cache = {}
+    has_item_catalog = {"market_hash_name", "item_kind"}.issubset(
+        table_columns(conn, "cs2_item_catalog")
+    )
+    if has_item_catalog:
+        market_names = list(dict.fromkeys(
+            item["best"].get("skin_name") or item["payload"].get("name") or ""
+            for item in grouped.values() if item["best"]
+        ))
+        for batch_start in range(0, len(market_names), 400):
+            batch = market_names[batch_start:batch_start + 400]
+            placeholders = ",".join("?" for _ in batch)
+            for catalog_row in conn.execute(
+                f"SELECT market_hash_name, item_kind FROM cs2_item_catalog "
+                f"WHERE market_hash_name IN ({placeholders})",
+                batch,
+            ):
+                if catalog_row[1] in {"weapon_skin", "knife", "glove"}:
+                    item_kind_cache[catalog_row[0]] = catalog_row[1]
     summary = {
-        "all": 0, "almaz": 0, "igor": 0, "nova": 0, "both": 0,
+        "all": 0, "almaz": 0, "igor": 0, "nova": 0, "vega": 0, "both": 0,
         "all_three": 0, "only_almaz": 0, "only_igor": 0, "only_nova": 0,
         "consensus": 0, "unanimous_three": 0,
         "disagreement": 0, "single_signal": 0,
     }
     for item in grouped.values():
         model_names = set(item["models"])
-        positive_model_names = {
+        decision_model_names = model_names - DEAL_ADVISORY_MODEL_NAMES
+        advisory_model_names = model_names & DEAL_ADVISORY_MODEL_NAMES
+        positive_decision_model_names = {
             model_name
             for model_name, model in item["models"].items()
-            if model.get("verdict") in DEAL_POSITIVE_VERDICTS
+            if model_name in decision_model_names
+            and model.get("verdict") in DEAL_POSITIVE_VERDICTS
         }
-        if not positive_model_names:
+        positive_advisory_model_names = {
+            model_name
+            for model_name, model in item["models"].items()
+            if model_name in advisory_model_names
+            and model.get("verdict") in DEAL_POSITIVE_VERDICTS
+        }
+        if not positive_decision_model_names:
             continue
 
-        dissenting_model_names = model_names - positive_model_names
-        if {"almaz", "igor", "nova"}.issubset(positive_model_names):
+        dissenting_model_names = (
+            decision_model_names - positive_decision_model_names
+        )
+        if {"almaz", "igor", "nova"}.issubset(positive_decision_model_names):
             item_category = "all_three"
-        elif {"almaz", "igor"}.issubset(positive_model_names):
+        elif {"almaz", "igor"}.issubset(positive_decision_model_names):
             item_category = "both"
-        elif positive_model_names == {"almaz"}:
+        elif positive_decision_model_names == {"almaz"}:
             item_category = "only_almaz"
-        elif positive_model_names == {"igor"}:
+        elif positive_decision_model_names == {"igor"}:
             item_category = "only_igor"
-        elif positive_model_names == {"nova"}:
+        elif positive_decision_model_names == {"nova"}:
             item_category = "only_nova"
         else:
-            item_category = "+".join(sorted(positive_model_names)) or "all"
+            item_category = "+".join(sorted(positive_decision_model_names)) or "all"
 
-        if positive_model_names == DEAL_MODEL_NAMES and not dissenting_model_names:
+        if (
+            positive_decision_model_names == DEAL_MODEL_NAMES
+            and not dissenting_model_names
+        ):
             confidence_level = "unanimous_three"
-        elif len(positive_model_names) >= 2 and not dissenting_model_names:
+        elif len(positive_decision_model_names) >= 2 and not dissenting_model_names:
             confidence_level = "consensus"
         elif dissenting_model_names:
             confidence_level = "disagreement"
@@ -12436,7 +13070,17 @@ def fetch_model_deal_comparison_page(
 
         best = item["best"] or {}
         payload = item["payload"] or {}
-        model_rows = list(item["models"].values())
+        market_name = best.get("skin_name") or payload.get("name") or ""
+        if market_name not in item_kind_cache:
+            item_kind_cache[market_name] = classify_name_fallback(market_name)
+        item_kind = item_kind_cache[market_name]
+        if asset_type != "all" and item_kind != asset_type:
+            continue
+        model_rows = [
+            model
+            for name, model in item["models"].items()
+            if name not in DEAL_ADVISORY_MODEL_NAMES
+        ]
         roi_values = [finite_float_value(model.get("roi_percent")) for model in model_rows]
         profit_values = [finite_int_value(model.get("profit_cents")) for model in model_rows]
         prediction_values = [
@@ -12473,10 +13117,13 @@ def fetch_model_deal_comparison_page(
         )
         item.update({
             "category": item_category,
+            "item_kind": item_kind,
             "confidence": confidence_level,
-            "positive_model_count": len(positive_model_names),
-            "active_model_count": len(model_names),
+            "positive_model_count": len(positive_decision_model_names),
+            "active_model_count": len(decision_model_names),
             "dissenting_models": sorted(dissenting_model_names),
+            "advisory_models": sorted(advisory_model_names),
+            "positive_advisory_models": sorted(positive_advisory_model_names),
             "skin_name": best.get("skin_name") or payload.get("name"),
             "source_sticker_id": best.get("source_sticker_id"),
             "source_sticker_name": best.get("source_sticker_name"),
@@ -12579,29 +13226,33 @@ def fetch_model_deal_comparison_page(
             continue
 
         summary["all"] += 1
-        if "almaz" in positive_model_names:
+        if "almaz" in positive_decision_model_names:
             summary["almaz"] += 1
-        if "igor" in positive_model_names:
+        if "igor" in positive_decision_model_names:
             summary["igor"] += 1
-        if "nova" in positive_model_names:
+        if "nova" in positive_decision_model_names:
             summary["nova"] += 1
-        if {"almaz", "igor"}.issubset(positive_model_names):
+        if "vega" in positive_advisory_model_names:
+            summary["vega"] += 1
+        if {"almaz", "igor"}.issubset(positive_decision_model_names):
             summary["both"] += 1
-        if {"almaz", "igor", "nova"}.issubset(positive_model_names):
+        if {"almaz", "igor", "nova"}.issubset(positive_decision_model_names):
             summary["all_three"] += 1
         if item_category in {"only_almaz", "only_igor", "only_nova"}:
             summary[item_category] += 1
         summary[confidence_level] += 1
 
-        if category == "almaz" and "almaz" not in positive_model_names:
+        if category == "almaz" and "almaz" not in positive_decision_model_names:
             continue
-        if category == "igor" and "igor" not in positive_model_names:
+        if category == "igor" and "igor" not in positive_decision_model_names:
             continue
-        if category == "nova" and "nova" not in positive_model_names:
+        if category == "nova" and "nova" not in positive_decision_model_names:
             continue
-        if category == "both" and not {"almaz", "igor"}.issubset(positive_model_names):
+        if category == "vega" and "vega" not in positive_advisory_model_names:
             continue
-        if category == "all_three" and not {"almaz", "igor", "nova"}.issubset(positive_model_names):
+        if category == "both" and not {"almaz", "igor"}.issubset(positive_decision_model_names):
+            continue
+        if category == "all_three" and not {"almaz", "igor", "nova"}.issubset(positive_decision_model_names):
             continue
         if category in {"only_almaz", "only_igor", "only_nova"} and item_category != category:
             continue
@@ -12699,6 +13350,17 @@ def fetch_model_deal_comparison_page(
     else:
         offset = 0
     page_rows = rows[offset:offset + limit]
+    for row in page_rows:
+        raw_prediction = sticker_predictions.get(row["listing_id"])
+        prediction_payload = {}
+        if raw_prediction:
+            try:
+                prediction_payload = json.loads(raw_prediction)
+            except (TypeError, json.JSONDecodeError):
+                pass
+        row["stickers"] = (
+            prediction_payload.get("stickers") or row["payload"].get("stickers") or []
+        )
     page_listing_ids = [
         row.get("listing_id") for row in page_rows if row.get("listing_id")
     ]
@@ -12743,6 +13405,8 @@ def fetch_model_deal_comparison_page(
         "max_float_value": max_float_value,
         "min_sticker_value_cents": min_sticker_value_cents,
         "confidence": confidence,
+        "asset_type": asset_type,
+        "discovery_source": discovery_source,
         "opinion_stale_hours": opinion_stale_hours,
     }
 
@@ -13366,6 +14030,56 @@ def get_dashboard_static_payload():
     return empty_dashboard_static_payload()
 
 
+DASHBOARD_HEAVY_CACHE_KEY = "dashboard_heavy"
+DASHBOARD_HEAVY_BUILD_LOCK = threading.Lock()
+
+
+def build_dashboard_heavy_payload():
+    """Aggregate the full-table counters used by the admin and public pages."""
+
+    with connect_db() as conn:
+        overview = fetch_overview(conn)
+        model_freshness = build_model_freshness(conn, overview.get("sales_count", 0))
+    return {
+        "overview": overview,
+        "model_freshness": model_freshness,
+        "aggregated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def get_dashboard_heavy_payload(wait_seconds=DASHBOARD_HEAVY_WAIT_SECONDS):
+    """Return cached heavy aggregates, refreshing them in the background.
+
+    The first call without a warm-up still computes synchronously, so command
+    line use and tests see exactly the previous behaviour.  While the startup
+    warm-up is running a request waits briefly and then returns ``None``; the
+    page renders its loading state and the next poll picks up the result.
+    """
+
+    cached, age = cache_get_with_age(DASHBOARD_HEAVY_CACHE_KEY)
+    if cached is not None:
+        if age is None or age > DASHBOARD_HEAVY_CACHE_TTL_SECONDS:
+            start_background_refresh(DASHBOARD_HEAVY_CACHE_KEY, build_dashboard_heavy_payload)
+        return cached
+
+    with CACHE_LOCK:
+        refreshing = DASHBOARD_HEAVY_CACHE_KEY in BACKGROUND_REFRESHING_KEYS
+    if not refreshing:
+        with DASHBOARD_HEAVY_BUILD_LOCK:
+            cached, _age = cache_get_with_age(DASHBOARD_HEAVY_CACHE_KEY)
+            if cached is not None:
+                return cached
+            return cache_set(DASHBOARD_HEAVY_CACHE_KEY, build_dashboard_heavy_payload())
+
+    deadline = time.monotonic() + max(float(wait_seconds or 0), 0.0)
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
+        cached, _age = cache_get_with_age(DASHBOARD_HEAVY_CACHE_KEY)
+        if cached is not None:
+            return cached
+    return None
+
+
 def build_dashboard_payload():
     status = read_json_file(STATUS_PATH, {})
 
@@ -13394,13 +14108,15 @@ def build_dashboard_payload():
     payload.update(get_dashboard_static_payload())
 
     try:
+        heavy = get_dashboard_heavy_payload()
+        if heavy is None:
+            payload["overview_refreshing"] = True
+        else:
+            payload["overview"] = heavy["overview"]
+            payload["model_freshness"] = heavy["model_freshness"]
+            payload["overview_aggregated_at"] = heavy.get("aggregated_at")
         with connect_db() as conn:
             payload["progress"] = fetch_progress(conn)
-            payload["overview"] = fetch_overview(conn)
-            payload["model_freshness"] = build_model_freshness(
-                conn,
-                payload["overview"].get("sales_count", 0),
-            )
             payload["recent_sales"] = fetch_recent_sales(conn, 20)
             payload["schedule_overview"] = fetch_schedule_overview(conn)
             payload["schedule_rows"] = fetch_schedule_rows(conn, 40)
@@ -14435,6 +15151,21 @@ def build_predict_deal_payload(payload):
                     "igor": igor_model_runtime.predict_deal,
                     "nova": neural_model_runtime.predict_deal,
                 }
+                # Vega is an advisory fourth opinion.  Before its first
+                # quality-gated generation exists, the three established
+                # models must continue to work without importing or loading
+                # an absent bootstrap artifact.  Once the pointer exists,
+                # runtime/import failures are surfaced as a Vega-only error.
+                try:
+                    vega_pointer = model_generations.read_active_pointer(
+                        "vega", project_dir=app_config.PROJECT_DIR
+                    )
+                    if vega_pointer is not None:
+                        import vega_model_runtime
+
+                        runners["vega"] = vega_model_runtime.predict_deal
+                except Exception as exc:  # noqa: BLE001 - isolate advisory model
+                    model_errors["vega"] = type(exc).__name__
             else:
                 return {
                     "error": "item type is unknown; choose an exact skin, knife, or glove name"
@@ -14462,8 +15193,21 @@ def build_predict_deal_payload(payload):
         # The manual comparison must never turn the most optimistic model into
         # an unexplained recommendation.  The primary figures use the lowest
         # available price estimate; every individual estimate remains visible.
+        decision_models = {
+            name: prediction
+            for name, prediction in models.items()
+            if name not in DEAL_ADVISORY_MODEL_NAMES
+        }
+        if not decision_models:
+            failed = ", ".join(sorted(model_errors)) or "all core models"
+            return {
+                "error": f"core prediction unavailable for {failed}",
+                "models": models,
+                "model_errors": model_errors,
+            }
+        selection_pool = decision_models
         selected_name, selected = min(
-            models.items(),
+            selection_pool.items(),
             key=lambda item: (
                 finite_number(item[1].get("predicted_price_cents"))
                 if finite_number(item[1].get("predicted_price_cents")) is not None
@@ -14472,10 +15216,10 @@ def build_predict_deal_payload(payload):
             ),
         )
 
-        active_models = set(models)
+        active_models = set(decision_models)
         positive_models = {
             name
-            for name, prediction in models.items()
+            for name, prediction in decision_models.items()
             if prediction.get("verdict") in DEAL_POSITIVE_VERDICTS
         }
         dissenting_models = active_models - positive_models
@@ -14492,7 +15236,7 @@ def build_predict_deal_payload(payload):
 
         predicted_values = [
             finite_number(model.get("predicted_price_cents"))
-            for model in models.values()
+            for model in selection_pool.values()
         ]
         predicted_values = [value for value in predicted_values if value is not None]
         result = dict(selected)
@@ -14505,6 +15249,12 @@ def build_predict_deal_payload(payload):
             "active_models": sorted(active_models),
             "positive_models": sorted(positive_models),
             "dissenting_models": sorted(dissenting_models),
+            "advisory_models": sorted(set(models) & DEAL_ADVISORY_MODEL_NAMES),
+            "positive_advisory_models": sorted(
+                name
+                for name in set(models) & DEAL_ADVISORY_MODEL_NAMES
+                if models[name].get("verdict") in DEAL_POSITIVE_VERDICTS
+            ),
             "unavailable_models": sorted(model_errors),
             "conservative_model": selected_name,
             "conservative_predicted_price_cents": selected.get(
@@ -14893,6 +15643,12 @@ def warm_price_model():
 
         price_model_runtime.load_model()
         neural_model_runtime.load_model()
+        if model_generations.read_active_pointer(
+            "vega", project_dir=app_config.PROJECT_DIR
+        ):
+            import vega_model_runtime
+
+            vega_model_runtime.load_model()
     except Exception as exc:
         print(f"Price model warm-up skipped: {exc}", flush=True)
 
@@ -15840,6 +16596,10 @@ class Handler(BaseHTTPRequestHandler):
             json_response(self, 200 if payload["ok"] else 503, payload)
             return
 
+        if parsed.path in {"/favicon.ico", "/favicon.svg"}:
+            favicon_response(self)
+            return
+
         if parsed.path in {"/admin/users", "/api/admin/users"}:
             if not is_direct_local_request(self):
                 if parsed.path.startswith("/api/"):
@@ -16503,6 +17263,8 @@ class Handler(BaseHTTPRequestHandler):
             min_liquidity = query.get("min_liquidity", [""])[0]
             max_float = query.get("max_float", [""])[0]
             min_sticker_value = query.get("min_sticker_value", [""])[0]
+            asset_type = query.get("asset_type", ["all"])[0]
+            discovery_source = query.get("discovery_source", ["all"])[0]
 
             try:
                 with connect_db() as conn:
@@ -16527,6 +17289,8 @@ class Handler(BaseHTTPRequestHandler):
                             min_liquidity,
                             max_float,
                             min_sticker_value,
+                            asset_type=asset_type,
+                            discovery_source=discovery_source,
                         ),
                     )
             except sqlite3.Error as exc:
@@ -16544,17 +17308,45 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, 429, {"error": "a database snapshot is already being created"})
                 return
             snapshot_path = None
+            download_id = None
+            self._file_response_started = False
             try:
+                service = get_account_service()
+                principal = current_account_session(self)
+                download_id = service.start_database_download(
+                    principal["user"]["id"] if principal else None,
+                    ip_address=account_request_metadata(self)["ip_address"],
+                )
                 snapshot_path = create_db_snapshot()
                 stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                filename = f"csfloat_history_{stamp}.db"
+
+                def report_progress(status, bytes_sent, total_bytes):
+                    service.update_database_download(
+                        download_id,
+                        status=status,
+                        bytes_sent=bytes_sent,
+                        total_bytes=total_bytes,
+                        filename=filename,
+                    )
+
                 file_response(
                     self,
                     snapshot_path,
-                    f"csfloat_history_{stamp}.db",
+                    filename,
                     "application/vnd.sqlite3",
+                    progress_callback=report_progress,
                 )
             except Exception as exc:
-                json_response(self, 500, {"error": str(exc)})
+                if download_id is not None:
+                    try:
+                        service.update_database_download(download_id, status="failed")
+                    except (account_backend.AccountError, OSError, sqlite3.Error):
+                        pass
+                if self._file_response_started:
+                    self.close_connection = True
+                else:
+                    json_response(self, 500, {"error": str(exc)})
             finally:
                 if snapshot_path:
                     try:
@@ -16775,6 +17567,9 @@ def main():
             ensure_dashboard_indexes()
             if Path(DB_PATH).exists():
                 start_background_refresh("dashboard_static", build_dashboard_static_payload)
+                start_background_refresh(
+                    DASHBOARD_HEAVY_CACHE_KEY, build_dashboard_heavy_payload
+                )
             threading.Thread(target=warm_price_model, daemon=True).start()
             threading.Thread(
                 target=warm_account_inventory_market_data,

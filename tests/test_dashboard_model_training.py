@@ -79,6 +79,7 @@ def test_training_payload_merges_public_jobs_and_cached_eligibility(monkeypatch)
                 "almaz": _job("almaz", state="running", job_id="a" * 32),
                 "igor": _job("igor"),
                 "nova": _job("nova"),
+                "vega": _job("vega"),
                 "knives": _job("knives"),
                 "gloves": _job("gloves"),
             },
@@ -158,6 +159,17 @@ def test_empty_eligibility_cache_returns_fail_closed_pending_without_blocking(
             dashboard_server.model_training_jobs.KNIFE_BOOTSTRAP_MIN_RUNTIME_VALID_ROWS
         ),
     }
+    assert result["vega"]["bootstrap"] is True
+    assert result["vega"]["item_kind"] == "weapon_skin"
+    assert result["vega"]["thresholds"] == {
+        "min_new_rows": dashboard_server.model_training_jobs.VEGA_BOOTSTRAP_MIN_ROWS,
+        "min_growth_percent": (
+            dashboard_server.model_training_jobs.MIN_DATA_GROWTH_PERCENT
+        ),
+        "min_runtime_valid_new_rows": (
+            dashboard_server.model_training_jobs.VEGA_BOOTSTRAP_MIN_RUNTIME_VALID_ROWS
+        ),
+    }
 
 
 def test_training_action_dispatch_is_whitelisted_and_never_accepts_paths(
@@ -187,11 +199,15 @@ def test_training_action_dispatch_is_whitelisted_and_never_accepts_paths(
     dashboard_server.update_model_training_from_payload(
         {"action": "start", "model": "knives"}
     )
+    dashboard_server.update_model_training_from_payload(
+        {"action": "start", "model": "vega"}
+    )
 
     assert calls == [
         ("start", "igor"),
         ("cancel", "nova", "b" * 32),
         ("start", "knives"),
+        ("start", "vega"),
     ]
     rejected = (
         {"action": "activate", "model": "almaz"},
@@ -206,6 +222,7 @@ def test_training_action_dispatch_is_whitelisted_and_never_accepts_paths(
         ("start", "igor"),
         ("cancel", "nova", "b" * 32),
         ("start", "knives"),
+        ("start", "vega"),
     ]
 
 
@@ -289,6 +306,7 @@ def test_model_training_http_routes_require_auth_and_reject_cross_origin(
             "almaz",
             "igor",
             "nova",
+            "vega",
             "knives",
             "gloves",
         }

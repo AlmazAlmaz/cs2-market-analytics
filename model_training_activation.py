@@ -14,16 +14,18 @@ from pathlib import Path
 from typing import Any
 
 import app_config
+import model_generations
 import model_lifecycle
+import portable_os
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - production is macOS/Linux.
-    fcntl = None
+except ImportError:  # Windows
+    import portable_fcntl as fcntl
 
 
 SCHEMA_VERSION = 1
-MODEL_NAMES = ("almaz", "igor", "nova", "knives")
+MODEL_NAMES = ("almaz", "igor", "nova", "vega", "knives", "gloves")
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -61,14 +63,7 @@ def _lock_path(project: Path) -> Path:
 
 
 def _fsync_directory(path: Path) -> None:
-    try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    portable_os.fsync_directory(path)
 
 
 def _secure_directory(path: Path, project: Path) -> None:
@@ -128,7 +123,7 @@ def _activation_lock(project: Path, *, blocking: bool = False):
     acquired = False
     try:
         descriptor = os.open(path, flags, 0o600)
-        os.fchmod(descriptor, 0o600)
+        portable_os.fchmod(descriptor, 0o600)
         operation = fcntl.LOCK_EX
         if not blocking:
             operation |= fcntl.LOCK_NB
@@ -166,7 +161,7 @@ def _training_idle_lock(project: Path):
     acquired = False
     try:
         descriptor = os.open(path, flags, 0o600)
-        os.fchmod(descriptor, 0o600)
+        portable_os.fchmod(descriptor, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         acquired = True
     except BlockingIOError as exc:
@@ -193,7 +188,9 @@ def _candidate_root(project: Path, model: str) -> Path:
         "almaz": project / "models" / "staging" / "training_jobs",
         "igor": project / "IGORMODEL" / "staging" / "training_jobs",
         "nova": project / "NEURALMODEL" / "staging" / "training_jobs",
+        "vega": project / "VEGAMODEL" / "staging" / "training_jobs",
         "knives": project / "KNIFEMODEL" / "staging" / "training_jobs",
+        "gloves": project / "GLOVEMODEL" / "staging" / "training_jobs",
     }
     return roots[model].resolve(strict=False)
 
@@ -228,6 +225,10 @@ def _validate_manifest(model: str, candidate: Path) -> dict[str, Any]:
     try:
         if model == "igor":
             from IGORMODEL.promote_candidate import validate_candidate
+
+            manifest = validate_candidate(candidate)
+        elif model == "vega":
+            from VEGAMODEL.promote_candidate import validate_candidate
 
             manifest = validate_candidate(candidate)
         else:
@@ -425,6 +426,11 @@ def activate_pending(
                     )
 
                     installed_sha = installed_candidate_bundle_sha256()
+                elif model == "vega":
+                    pointer = model_generations.read_active_pointer(
+                        model, project_dir=project
+                    )
+                    installed_sha = pointer.get("generation_id") if pointer else None
                 else:
                     from model_candidate_promotion import (
                         installed_candidate_bundle_sha256,
@@ -455,6 +461,14 @@ def activate_pending(
                     from IGORMODEL.promote_candidate import promote_candidate
 
                     result = promote_candidate(candidate, offline_confirm=True)
+                elif model == "vega":
+                    result = model_generations.publish_candidate(
+                        model,
+                        candidate,
+                        manifest=fresh,
+                        job_id=record["job_id"],
+                        project_dir=project,
+                    )
                 else:
                     from model_candidate_promotion import promote_candidate
 

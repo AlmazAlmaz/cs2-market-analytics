@@ -1000,16 +1000,23 @@ def render_catalog_page(locale: str = "ru") -> str:
     )
     rendered = rendered.replace(
         "noPrice:'цены пока нет',authoritative:",
-        "noPrice:'цены пока нет',referencePrice:'справочно',authoritative:",
+        "noPrice:'цены пока нет',referencePrice:'справочно',lastSeen:'последняя продажа · {d}',authoritative:",
         1,
     ).replace(
         "noPrice:'no price yet',authoritative:",
-        "noPrice:'no price yet',referencePrice:'reference',authoritative:",
+        "noPrice:'no price yet',referencePrice:'reference',lastSeen:'last sale · {d}',authoritative:",
         1,
     )
+    # A variant without a sale in the last week still has a real last median.
+    # Showing "no price yet" next to a non-zero 30-day sales counter read as a
+    # contradiction, so the stale median is shown muted with its sale date.
     rendered = rendered.replace(
         "price.textContent=money(stickers?item.reference_price_cents:item.current_price_cents);",
-        "price.textContent=stickers?(item.reference_price_cents===null||item.reference_price_cents===undefined?tr('noPrice'):`${tr('referencePrice')} ${money(item.reference_price_cents)}`):money(item.current_price_cents);",
+        "const hasCents=value=>value!==null&&value!==undefined&&value!==''&&Number.isFinite(Number(value));"
+        "const stalePrice=!stickers&&!hasCents(item.current_price_cents)&&hasCents(item.last_observed_price_cents);"
+        "price.textContent=stickers?(item.reference_price_cents===null||item.reference_price_cents===undefined?tr('noPrice'):`${tr('referencePrice')} ${money(item.reference_price_cents)}`):money(stalePrice?item.last_observed_price_cents:item.current_price_cents);"
+        "if(stalePrice){price.classList.add('stale');const when=document.createElement('small');when.className='price-asof';"
+        "when.textContent=tr('lastSeen',{d:String(item.last_observed_day||'').split('-').reverse().slice(0,2).join('.')});price.appendChild(when);}",
         1,
     )
     rendered = rendered.replace(

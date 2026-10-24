@@ -2,13 +2,53 @@ import json
 import math
 import pickle
 import sqlite3
+from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
 import igor_model_runtime
 from IGORMODEL import build_cache, data_loading, feature_contract, features
 from IGORMODEL import train as igor_train
+
+
+def test_calibration_widens_raw_interval_without_touching_point_prediction():
+    rows = 1_000
+    point = np.zeros(rows, dtype=float)
+    low = np.full(rows, -0.2, dtype=float)
+    high = np.full(rows, 0.2, dtype=float)
+    low[:50] = 0.5
+    high[:50] = 0.6
+    validation = pd.DataFrame(
+        {
+            "log_premium": np.zeros(rows, dtype=float),
+            "log_reference_predicted_price": np.zeros(rows, dtype=float),
+            "price_cents": np.ones(rows, dtype=float),
+        }
+    )
+
+    calibration = igor_train.calibrate_predictions(
+        point,
+        low,
+        high,
+        validation,
+    )
+
+    scale = calibration["premium_scale"]
+    center = point * scale + calibration["center_offset"]
+    calibrated_low = low * scale + calibration["low_offset"]
+    calibrated_high = high * scale + calibration["high_offset"]
+    outside = np.mean(
+        (center < np.minimum(calibrated_low, calibrated_high))
+        | (center > np.maximum(calibrated_low, calibrated_high))
+    )
+    assert calibration["validation_point_outside_raw_rate_before"] > 0.01
+    assert calibration["point_containment_margin"] > 0
+    assert outside <= igor_train.VALIDATION_POINT_OUTSIDE_TARGET
+    assert calibration["validation_point_outside_raw_rate_after"] == pytest.approx(
+        outside
+    )
 
 
 def sale_frame(**overrides):
@@ -416,7 +456,9 @@ def test_igor_weapon_source_hash_ignores_glove_rows_and_children(tmp_path):
 
 def test_runtime_import_uses_case_correct_igor_package():
     assert igor_model_runtime.IGOR_DIR.name == "IGORMODEL"
-    assert "IGORMODEL/features.py" in igor_model_runtime.igor_features.__file__
+    assert "IGORMODEL/features.py" in Path(
+        igor_model_runtime.igor_features.__file__
+    ).as_posix()
 
 
 def test_v2_runtime_fails_closed_on_artifact_contract_drift():

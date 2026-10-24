@@ -1,5 +1,6 @@
 import hashlib
 import inspect
+import os
 import stat
 import threading
 from pathlib import Path
@@ -7,6 +8,15 @@ from pathlib import Path
 import pytest
 
 import model_generations as generations
+
+
+def _symlink_or_skip(link: Path, target, *, target_is_directory=False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is not enabled")
+        raise
 
 
 def _sha(path: Path) -> str:
@@ -107,11 +117,12 @@ def test_publish_creates_verified_immutable_generation_and_atomic_pointer(
         model, legacy, project_dir=tmp_path
     )
     assert generation_dir.name == manifest["bundle_sha256"]
-    assert stat.S_IMODE(generation_dir.stat().st_mode) == 0o500
-    assert all(
-        stat.S_IMODE((generation_dir / filename).stat().st_mode) == 0o400
-        for filename in generations.MODEL_FILES[model]
-    )
+    if os.name != "nt":
+        assert stat.S_IMODE(generation_dir.stat().st_mode) == 0o500
+        assert all(
+            stat.S_IMODE((generation_dir / filename).stat().st_mode) == 0o400
+            for filename in generations.MODEL_FILES[model]
+        )
     assert before == {
         filename: (legacy / filename).read_bytes()
         for filename in generations.MODEL_FILES[model]
@@ -330,7 +341,11 @@ def test_pointer_and_candidate_symlinks_fail_closed(tmp_path):
     redirected = tmp_path / "redirected"
     redirected.mkdir()
     bad_job = "1" * 32
-    (tmp_path / generations.STAGING_ROOTS[model] / bad_job).symlink_to(redirected)
+    _symlink_or_skip(
+        tmp_path / generations.STAGING_ROOTS[model] / bad_job,
+        redirected,
+        target_is_directory=True,
+    )
     with pytest.raises(generations.GenerationError, match="symlink"):
         generations._publish_candidate(
             model,
@@ -353,7 +368,7 @@ def test_pointer_and_candidate_symlinks_fail_closed(tmp_path):
     )
     pointer = tmp_path / ".model_generations" / model / generations.ACTIVE_POINTER
     pointer.unlink()
-    pointer.symlink_to(tmp_path / "outside.json")
+    _symlink_or_skip(pointer, tmp_path / "outside.json")
     with pytest.raises(generations.GenerationError):
         generations.read_active_pointer(model, project_dir=tmp_path)
 

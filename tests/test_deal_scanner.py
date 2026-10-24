@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import stat
 
@@ -47,11 +48,43 @@ def scanner_target_control(**profile_overrides):
     }
 
 
-def test_legacy_interval_uses_same_bounds_as_persistent_control():
-    with pytest.raises(ValueError, match="scan_interval_seconds must be between 60 and 86400"):
-        scanner_config(scan_interval_seconds=59)
+def test_vega_is_optional_until_a_verified_generation_is_active(monkeypatch):
+    config = scanner_config(enabled_models=["almaz", "igor", "nova", "vega"])
+    monkeypatch.setattr(
+        deal_scanner.model_generations,
+        "read_active_pointer",
+        lambda *_args, **_kwargs: None,
+    )
 
+    assert deal_scanner.enabled_model_names(config) == ["almaz", "igor", "nova"]
+
+    monkeypatch.setattr(
+        deal_scanner.model_generations,
+        "read_active_pointer",
+        lambda *_args, **_kwargs: {"generation_id": "a" * 64},
+    )
+
+    assert deal_scanner.enabled_model_names(config) == [
+        "almaz",
+        "igor",
+        "nova",
+        "vega",
+    ]
+    assert "vega" in deal_scanner.ADVISORY_MODEL_NAMES
+
+
+def test_legacy_interval_uses_same_bounds_as_persistent_control():
+    for value in (-1, 1, 59, 86401):
+        with pytest.raises(ValueError, match="scan_interval_seconds must be 0 or between 60 and 86400"):
+            scanner_config(scan_interval_seconds=value)
+
+    for value in (True, 60.5, "invalid", None):
+        with pytest.raises(ValueError, match="scan_interval_seconds must be an integer"):
+            scanner_config(scan_interval_seconds=value)
+
+    assert scanner_config(scan_interval_seconds=0)["scan_interval_seconds"] == 0
     assert scanner_config(scan_interval_seconds=60)["scan_interval_seconds"] == 60
+    assert scanner_config(scan_interval_seconds=86400)["scan_interval_seconds"] == 86400
 
 
 @pytest.mark.parametrize(
@@ -571,14 +604,18 @@ def test_scanner_instance_lock_rejects_a_second_owner(tmp_path):
     lock_path = tmp_path / "deal_scanner.lock"
 
     with deal_scanner.scanner_instance_lock(lock_path):
-        assert lock_path.read_text(encoding="utf-8") == str(deal_scanner.os.getpid())
-        assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+        if os.name != "nt":
+            assert lock_path.read_text(encoding="utf-8") == str(
+                deal_scanner.os.getpid()
+            )
+            assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
         with (
             pytest.raises(RuntimeError, match="deal_scanner is already running"),
             deal_scanner.scanner_instance_lock(lock_path),
         ):
             pass
 
+    assert lock_path.read_text(encoding="utf-8") == str(deal_scanner.os.getpid())
     with deal_scanner.scanner_instance_lock(lock_path):
         pass
 

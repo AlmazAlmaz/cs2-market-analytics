@@ -667,6 +667,7 @@ def test_page_is_bilingual_honest_and_uses_existing_series_api():
             ["node", "--check"],
             input=scripts[-1],
             text=True,
+            encoding="utf-8",
             check=True,
             capture_output=True,
         )

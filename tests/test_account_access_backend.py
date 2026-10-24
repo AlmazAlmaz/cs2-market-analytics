@@ -98,6 +98,7 @@ def test_v1_migration_makes_every_legacy_account_pending_and_revokes_sessions(
         "blocked": 0,
         "deleted": 0,
         "online": 0,
+        "downloading": 0,
     }
 
     # The privilege drop is a one-time v1 -> v2 migration.  An administrator
